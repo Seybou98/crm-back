@@ -3,6 +3,9 @@ const express = require('express');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
 
+// Forcer le mode développement
+process.env.NODE_ENV = 'development';
+
 // Configuration
 const WEBHOOK_SECRET = process.env.GOCARDLESS_WEBHOOK_SECRET || 'your_webhook_secret_here';
 const ALLOWED_IPS = process.env.ALLOWED_IPS ? process.env.ALLOWED_IPS.split(',') : ['127.0.0.1'];
@@ -28,6 +31,19 @@ admin.initializeApp({
 });
 
 const app = express();
+
+// Middleware pour gérer les erreurs JSON
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    console.error('Erreur de parsing JSON:', err.message);
+    return res.status(400).json({
+      error: 'Invalid JSON',
+      message: err.message
+    });
+  }
+  next();
+});
+
 app.use(express.json());
 
 // Route de base pour vérifier que le serveur fonctionne
@@ -35,7 +51,8 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     message: 'GoCardless webhook server is running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV
   });
 });
 
@@ -45,6 +62,7 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV,
     firebase: {
       connected: admin.apps.length > 0,
       projectId: process.env.FIREBASE_PROJECT_ID
@@ -62,6 +80,7 @@ function checkIP(req, res, next) {
   console.log('- IP du client:', clientIP);
   console.log('- X-Forwarded-For:', forwardedFor);
   console.log('- X-Real-IP:', realIP);
+  console.log('- Mode:', process.env.NODE_ENV);
   
   // En mode développement, autoriser toutes les IPs
   if (process.env.NODE_ENV === 'development') {
@@ -79,7 +98,8 @@ function checkIP(req, res, next) {
         clientIP,
         forwardedFor,
         realIP,
-        ipChecked: ipToCheck
+        ipChecked: ipToCheck,
+        environment: process.env.NODE_ENV
       }
     });
   }
