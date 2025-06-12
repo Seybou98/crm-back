@@ -141,18 +141,43 @@ function checkIP(req, res, next) {
 // Middleware pour vérifier la signature GoCardless
 function verifyWebhookSignature(req, res, next) {
   const signature = req.headers['webhook-signature'];
+  console.log('Signature reçue:', signature);
+  
+  // En mode développement, autoriser les requêtes sans signature
+  if (process.env.NODE_ENV === 'development') {
+    console.log('Mode développement: signature ignorée');
+    return next();
+  }
+
   if (!signature) {
     console.error('Signature manquante');
-    return res.status(401).send('Signature manquante');
+    return res.status(401).json({
+      error: 'Signature manquante',
+      details: {
+        headers: req.headers,
+        environment: process.env.NODE_ENV
+      }
+    });
   }
 
   const rawBody = JSON.stringify(req.body);
   const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET);
   const calculatedSignature = hmac.update(rawBody).digest('hex');
+  
+  console.log('Signature calculée:', calculatedSignature);
+  console.log('Body reçu:', rawBody);
 
   if (signature !== calculatedSignature) {
     console.error('Signature invalide');
-    return res.status(401).send('Signature invalide');
+    return res.status(401).json({
+      error: 'Signature invalide',
+      details: {
+        received: signature,
+        calculated: calculatedSignature,
+        body: rawBody,
+        environment: process.env.NODE_ENV
+      }
+    });
   }
 
   next();
