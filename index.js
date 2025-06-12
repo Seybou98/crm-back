@@ -55,12 +55,37 @@ app.get('/health', (req, res) => {
 // Middleware pour vérifier l'IP
 function checkIP(req, res, next) {
   const clientIP = req.ip || req.connection.remoteAddress;
-  console.log('IP du client:', clientIP);
+  const forwardedFor = req.headers['x-forwarded-for'];
+  const realIP = req.headers['x-real-ip'];
   
-  if (!ALLOWED_IPS.includes(clientIP)) {
-    console.error('IP non autorisée:', clientIP);
-    return res.status(403).send('IP non autorisée');
+  console.log('Informations de connexion:');
+  console.log('- IP du client:', clientIP);
+  console.log('- X-Forwarded-For:', forwardedFor);
+  console.log('- X-Real-IP:', realIP);
+  console.log('- IPs autorisées:', ALLOWED_IPS);
+  
+  // Pour le développement et les tests, autoriser toutes les IPs
+  if (process.env.NODE_ENV === 'development') {
+    console.log('Mode développement: toutes les IPs sont autorisées');
+    return next();
   }
+  
+  // Vérifier l'IP réelle ou l'IP forwardée
+  const ipToCheck = realIP || forwardedFor || clientIP;
+  if (!ALLOWED_IPS.includes(ipToCheck)) {
+    console.error('IP non autorisée:', ipToCheck);
+    return res.status(403).json({
+      error: 'IP non autorisée',
+      details: {
+        clientIP,
+        forwardedFor,
+        realIP,
+        allowedIPs: ALLOWED_IPS
+      }
+    });
+  }
+  
+  console.log('IP autorisée:', ipToCheck);
   next();
 }
 
