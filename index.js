@@ -30,6 +30,28 @@ admin.initializeApp({
 const app = express();
 app.use(express.json());
 
+// Route de base pour vérifier que le serveur fonctionne
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    message: 'GoCardless webhook server is running',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Route de santé pour le monitoring
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    firebase: {
+      connected: admin.apps.length > 0,
+      projectId: process.env.FIREBASE_PROJECT_ID
+    }
+  });
+});
+
 // Middleware pour vérifier l'IP
 function checkIP(req, res, next) {
   const clientIP = req.ip || req.connection.remoteAddress;
