@@ -2,14 +2,18 @@ require('dotenv').config();
 const express = require('express');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
-const serviceAccount = require('./serviceAccountKey.json');
 
 // Configuration
 const WEBHOOK_SECRET = process.env.GOCARDLESS_WEBHOOK_SECRET || 'your_webhook_secret_here';
 const ALLOWED_IPS = process.env.ALLOWED_IPS ? process.env.ALLOWED_IPS.split(',') : ['127.0.0.1'];
 
+// Initialiser Firebase Admin avec les variables d'environnement
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n')
+  })
 });
 
 const app = express();
