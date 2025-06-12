@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
 
 // Forcer le mode développement
 process.env.NODE_ENV = 'development';
@@ -20,13 +22,41 @@ const firebaseConfig = {
   appId: process.env.FIREBASE_APP_ID
 };
 
-// Initialiser Firebase Admin avec les variables d'environnement
+// Initialiser Firebase Admin
+let serviceAccount;
+try {
+  // Lire le fichier serviceAccountKey.json
+  const serviceAccountPath = path.join(__dirname, 'serviceAccountKey.json');
+  console.log('Tentative de lecture du fichier:', serviceAccountPath);
+  
+  if (fs.existsSync(serviceAccountPath)) {
+    const rawData = fs.readFileSync(serviceAccountPath, 'utf8');
+    serviceAccount = JSON.parse(rawData);
+    console.log('Fichier serviceAccountKey.json chargé avec succès');
+  } else {
+    throw new Error('Fichier serviceAccountKey.json non trouvé');
+  }
+} catch (error) {
+  console.error('Erreur lors de la lecture du fichier serviceAccountKey.json:', error.message);
+  // Si le fichier n'existe pas, utiliser les variables d'environnement
+  console.log('Utilisation des variables d\'environnement pour Firebase');
+  serviceAccount = {
+    type: 'service_account',
+    project_id: process.env.FIREBASE_PROJECT_ID,
+    private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+    private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    client_email: process.env.FIREBASE_CLIENT_EMAIL,
+    client_id: process.env.FIREBASE_CLIENT_ID,
+    auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+    token_uri: 'https://oauth2.googleapis.com/token',
+    auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+    client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL
+  };
+}
+
+// Initialiser l'application Firebase
 admin.initializeApp({
-  credential: admin.credential.cert({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n')
-  }),
+  credential: admin.credential.cert(serviceAccount),
   ...firebaseConfig
 });
 
@@ -253,5 +283,27 @@ app.post('/webhook', checkIP, verifyWebhookSignature, async (req, res) => {
   }
 });
 
+// Fonction pour démarrer le serveur
+function startServer(port) {
+  return new Promise((resolve, reject) => {
+    const server = app.listen(port, () => {
+      console.log(`Serveur démarré sur le port ${port}`);
+      resolve(server);
+    }).on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.log(`Le port ${port} est déjà utilisé, tentative avec le port ${port + 1}`);
+        startServer(port + 1).then(resolve).catch(reject);
+      } else {
+        console.error('Erreur lors du démarrage du serveur:', err);
+        reject(err);
+      }
+    });
+  });
+}
+
+// Démarrer le serveur
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`)); 
+startServer(PORT).catch(err => {
+  console.error('Impossible de démarrer le serveur:', err);
+  process.exit(1);
+}); 
