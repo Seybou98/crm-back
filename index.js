@@ -187,101 +187,111 @@ function verifyWebhookSignature(req, res, next) {
 async function handleEvent(event) {
   const { action, resource_type, details } = event;
   console.log(`Traitement de l'événement: ${action} pour ${resource_type}`);
+  console.log('Données complètes:', JSON.stringify(event, null, 2));
 
   // Créer une référence au document de paiement
   const paymentRef = admin.firestore().collection('payments').doc(event.id);
+  console.log('Référence Firestore créée pour:', event.id);
 
   // Vérifier si le document existe
   const doc = await paymentRef.get();
   const exists = doc.exists;
+  console.log('Document existe déjà:', exists);
 
-  switch (action) {
-    case 'created':
-      await paymentRef.set({
-        ...event,
-        status: 'pending',
-        receivedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      console.log(`Paiement créé: ${event.id}`);
-      break;
-
-    case 'confirmed':
-      if (!exists) {
+  try {
+    switch (action) {
+      case 'created':
         await paymentRef.set({
           ...event,
-          status: 'confirmed',
-          confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+          status: 'pending',
           receivedAt: admin.firestore.FieldValue.serverTimestamp()
         });
-      } else {
-        await paymentRef.update({
-          status: 'confirmed',
-          confirmedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-      }
-      console.log(`Paiement confirmé: ${event.id}`);
-      break;
+        console.log(`Paiement créé dans Firestore: ${event.id}`);
+        break;
 
-    case 'failed':
-      if (!exists) {
+      case 'confirmed':
+        if (!exists) {
+          await paymentRef.set({
+            ...event,
+            status: 'confirmed',
+            confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+            receivedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        } else {
+          await paymentRef.update({
+            status: 'confirmed',
+            confirmedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        }
+        console.log(`Paiement confirmé dans Firestore: ${event.id}`);
+        break;
+
+      case 'failed':
+        if (!exists) {
+          await paymentRef.set({
+            ...event,
+            status: 'failed',
+            failedAt: admin.firestore.FieldValue.serverTimestamp(),
+            failureReason: details?.cause || 'unknown',
+            receivedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        } else {
+          await paymentRef.update({
+            status: 'failed',
+            failedAt: admin.firestore.FieldValue.serverTimestamp(),
+            failureReason: details?.cause || 'unknown'
+          });
+        }
+        console.log(`Paiement échoué dans Firestore: ${event.id}`);
+        break;
+
+      case 'cancelled':
+        if (!exists) {
+          await paymentRef.set({
+            ...event,
+            status: 'cancelled',
+            cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+            receivedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        } else {
+          await paymentRef.update({
+            status: 'cancelled',
+            cancelledAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        }
+        console.log(`Paiement annulé dans Firestore: ${event.id}`);
+        break;
+
+      case 'paid_out':
+        if (!exists) {
+          await paymentRef.set({
+            ...event,
+            status: 'paid_out',
+            paidOutAt: admin.firestore.FieldValue.serverTimestamp(),
+            receivedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        } else {
+          await paymentRef.update({
+            status: 'paid_out',
+            paidOutAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        }
+        console.log(`Paiement versé dans Firestore: ${event.id}`);
+        break;
+
+      default:
+        console.log(`Événement non géré: ${action}`);
         await paymentRef.set({
           ...event,
-          status: 'failed',
-          failedAt: admin.firestore.FieldValue.serverTimestamp(),
-          failureReason: details?.cause || 'unknown',
+          status: 'unknown',
           receivedAt: admin.firestore.FieldValue.serverTimestamp()
         });
-      } else {
-        await paymentRef.update({
-          status: 'failed',
-          failedAt: admin.firestore.FieldValue.serverTimestamp(),
-          failureReason: details?.cause || 'unknown'
-        });
-      }
-      console.log(`Paiement échoué: ${event.id}`);
-      break;
-
-    case 'cancelled':
-      if (!exists) {
-        await paymentRef.set({
-          ...event,
-          status: 'cancelled',
-          cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
-          receivedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-      } else {
-        await paymentRef.update({
-          status: 'cancelled',
-          cancelledAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-      }
-      console.log(`Paiement annulé: ${event.id}`);
-      break;
-
-    case 'paid_out':
-      if (!exists) {
-        await paymentRef.set({
-          ...event,
-          status: 'paid_out',
-          paidOutAt: admin.firestore.FieldValue.serverTimestamp(),
-          receivedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-      } else {
-        await paymentRef.update({
-          status: 'paid_out',
-          paidOutAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-      }
-      console.log(`Paiement versé: ${event.id}`);
-      break;
-
-    default:
-      console.log(`Événement non géré: ${action}`);
-      await paymentRef.set({
-        ...event,
-        status: 'unknown',
-        receivedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+    }
+    
+    console.log('Opération Firestore réussie pour:', event.id);
+  } catch (error) {
+    console.error('Erreur lors de l\'enregistrement dans Firestore:', error);
+    throw error;
   }
 }
 
