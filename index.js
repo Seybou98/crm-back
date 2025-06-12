@@ -302,7 +302,7 @@ function startServer(port) {
 }
 
 // Démarrer le serveur
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;  // Utiliser le port 10000 par défaut
 startServer(PORT).catch(err => {
   console.error('Impossible de démarrer le serveur:', err);
   process.exit(1);
