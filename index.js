@@ -62,16 +62,15 @@ function checkIP(req, res, next) {
   console.log('- IP du client:', clientIP);
   console.log('- X-Forwarded-For:', forwardedFor);
   console.log('- X-Real-IP:', realIP);
-  console.log('- IPs autorisées:', ALLOWED_IPS);
   
-  // Pour le développement et les tests, autoriser toutes les IPs
+  // En mode développement, autoriser toutes les IPs
   if (process.env.NODE_ENV === 'development') {
     console.log('Mode développement: toutes les IPs sont autorisées');
     return next();
   }
   
-  // Vérifier l'IP réelle ou l'IP forwardée
-  const ipToCheck = realIP || forwardedFor || clientIP;
+  // En production, vérifier l'IP
+  const ipToCheck = realIP || (forwardedFor ? forwardedFor.split(',')[0].trim() : clientIP);
   if (!ALLOWED_IPS.includes(ipToCheck)) {
     console.error('IP non autorisée:', ipToCheck);
     return res.status(403).json({
@@ -80,7 +79,7 @@ function checkIP(req, res, next) {
         clientIP,
         forwardedFor,
         realIP,
-        allowedIPs: ALLOWED_IPS
+        ipChecked: ipToCheck
       }
     });
   }
