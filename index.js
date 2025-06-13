@@ -4,6 +4,8 @@ const admin = require('firebase-admin');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
+const gocardless = require('gocardless');
+const cors = require('cors');
 
 // Forcer le mode développement
 process.env.NODE_ENV = 'development';
@@ -61,6 +63,18 @@ admin.initializeApp({
 });
 
 const app = express();
+
+// Configuration CORS
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'https://crm-label-pose-dev.web.app',
+    'https://resonant-marshmallow-198dc0.netlify.app'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin'],
+  credentials: true
+}));
 
 // Middleware pour gérer les erreurs JSON
 app.use((err, req, res, next) => {
@@ -315,6 +329,93 @@ app.post('/webhook', checkIP, verifyWebhookSignature, async (req, res) => {
   } catch (error) {
     console.error('Erreur lors du traitement:', error);
     res.status(500).send(error.message);
+  }
+});
+
+// Endpoint pour créer un mandat GoCardless
+app.post('/create-mandate', async (req, res) => {
+  try {
+    const {
+      clientId,
+      clientName,
+      clientEmail,
+      clientAddress,
+      redirectUrl,
+      amount,
+      currency,
+      interval
+    } = req.body;
+
+    // Créer ou récupérer le client GoCardless
+    let customer;
+    try {
+      const customers = await gocardless.customers.list({
+        query: `email=${clientEmail}`
+      });
+      
+      if (customers.customers.length > 0) {
+        customer = customers.customers[0];
+      } else {
+        customer = await gocardless.customers.create({
+          email: clientEmail,
+          given_name: clientName,
+          family_name: clientName,
+          address_line1: clientAddress.street,
+          city: clientAddress.city,
+          postal_code: clientAddress.postalCode,
+          country_code: clientAddress.country
+        });
+      }
+    } catch (error) {
+      console.error('Error with GoCardless customer:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to create or retrieve GoCardless customer'
+      });
+    }
+
+    // Créer la page de mandat
+    const mandatePages = await gocardless.mandate_pages.create({
+      scheme: 'bacs',
+      customer: customer.id,
+      success_redirect_url: redirectUrl,
+      prefilled_customer: {
+        email: clientEmail,
+        given_name: clientName,
+        family_name: clientName,
+        address_line1: clientAddress.street,
+        city: clientAddress.city,
+        postal_code: clientAddress.postalCode,
+        country_code: clientAddress.country
+      }
+    });
+
+    // Créer le paiement récurrent
+    const subscription = await gocardless.subscriptions.create({
+      amount: amount * 100, // Convertir en centimes
+      currency: currency,
+      interval_unit: interval === 'monthly' ? 'monthly' : interval === 'quarterly' ? 'quarterly' : 'yearly',
+      links: {
+        mandate: mandatePages.mandate_id
+      },
+      metadata: {
+        clientId: clientId
+      }
+    });
+
+    return res.json({
+      success: true,
+      redirectUrl: mandatePages.url,
+      gocardlessCustomerId: customer.id,
+      mandateId: mandatePages.mandate_id,
+      subscriptionId: subscription.id
+    });
+  } catch (error) {
+    console.error('Error creating GoCardless mandate:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
