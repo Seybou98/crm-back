@@ -4,7 +4,7 @@ const admin = require('firebase-admin');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
-const gocardless = require('gocardless');
+const gocardless = require('gocardless-nodejs');
 const cors = require('cors');
 
 // Forcer le mode développement
