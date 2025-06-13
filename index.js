@@ -69,7 +69,8 @@ app.use(cors({
   origin: [
     'http://localhost:5173',
     'https://crm-label-pose-dev.web.app',
-    'https://resonant-marshmallow-198dc0.netlify.app'
+    'https://resonant-marshmallow-198dc0.netlify.app',
+    'https://seybou-crm.netlify.app'
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin'],
@@ -89,6 +90,9 @@ app.use((err, req, res, next) => {
 });
 
 app.use(express.json());
+
+// Gestion des requêtes OPTIONS
+app.options('*', cors());
 
 // Route de base pour vérifier que le serveur fonctionne
 app.get('/', (req, res) => {
@@ -415,6 +419,61 @@ app.post('/create-mandate', async (req, res) => {
     return res.status(500).json({
       success: false,
       error: error.message
+    });
+  }
+});
+
+// Route pour créer un paiement
+app.post('/create-payment', async (req, res) => {
+  try {
+    const { amount, currency, description, mandate_id, reference } = req.body;
+
+    // Validation des données requises
+    if (!amount || !currency || !mandate_id) {
+      return res.status(400).json({
+        error: 'Données manquantes',
+        required: ['amount', 'currency', 'mandate_id']
+      });
+    }
+
+    // Configuration du client GoCardless
+    const client = gocardless({
+      access_token: process.env.GOCARDLESS_ACCESS_TOKEN,
+      environment: process.env.NODE_ENV === 'production' ? 'live' : 'sandbox'
+    });
+
+    // Création du paiement
+    const payment = await client.payments.create({
+      amount: amount * 100, // Conversion en centimes
+      currency: currency,
+      description: description || 'Paiement CRM',
+      mandate: mandate_id,
+      reference: reference || `PAY-${Date.now()}`,
+      metadata: {
+        source: 'crm',
+        created_at: new Date().toISOString()
+      }
+    });
+
+    // Enregistrement dans Firebase
+    const db = admin.firestore();
+    await db.collection('payments').doc(payment.id).set({
+      ...payment,
+      created_at: new Date().toISOString(),
+      status: 'pending'
+    });
+
+    res.json({
+      success: true,
+      payment: payment,
+      message: 'Paiement créé avec succès'
+    });
+
+  } catch (error) {
+    console.error('Erreur lors de la création du paiement:', error);
+    res.status(500).json({
+      error: 'Erreur lors de la création du paiement',
+      details: error.message
     });
   }
 });
