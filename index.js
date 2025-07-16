@@ -6,6 +6,9 @@ const path = require('path');
 const fs = require('fs');
 const gocardless = require('gocardless-nodejs');
 const cors = require('cors');
+const axios = require('axios');
+const YOUSIGN_API_URL = 'https://api-sandbox.yousign.com/v3';
+const YOUSIGN_API_KEY = process.env.YOUSIGN_API_KEY;
 
 // Forcer le mode développement
 process.env.NODE_ENV = 'development';
@@ -339,6 +342,8 @@ app.post('/webhook', checkIP, verifyWebhookSignature, async (req, res) => {
 // Endpoint pour créer un mandat GoCardless
 app.post('/create-mandate', async (req, res) => {
   try {
+    console.log('--- [GoCardless] Initialisation du prélèvement ---');
+    console.log('Données reçues pour /create-mandate :', JSON.stringify(req.body, null, 2));
     const {
       clientId,
       clientName,
@@ -353,13 +358,15 @@ app.post('/create-mandate', async (req, res) => {
     // Créer ou récupérer le client GoCardless
     let customer;
     try {
+      console.log('Recherche du client GoCardless pour l’email :', clientEmail);
       const customers = await gocardless.customers.list({
         query: `email=${clientEmail}`
       });
-      
       if (customers.customers.length > 0) {
         customer = customers.customers[0];
+        console.log('Client GoCardless existant trouvé :', customer.id);
       } else {
+        console.log('Aucun client existant, création d’un nouveau client GoCardless...');
         customer = await gocardless.customers.create({
           email: clientEmail,
           given_name: clientName,
@@ -369,9 +376,10 @@ app.post('/create-mandate', async (req, res) => {
           postal_code: clientAddress.postalCode,
           country_code: clientAddress.country
         });
+        console.log('Nouveau client GoCardless créé :', customer.id);
       }
     } catch (error) {
-      console.error('Error with GoCardless customer:', error);
+      console.error('Erreur lors de la création/récupération du client GoCardless:', error);
       return res.status(500).json({
         success: false,
         error: 'Failed to create or retrieve GoCardless customer'
@@ -379,6 +387,7 @@ app.post('/create-mandate', async (req, res) => {
     }
 
     // Créer la page de mandat
+    console.log('Création de la page de mandat GoCardless pour le client :', customer.id);
     const mandatePages = await gocardless.mandate_pages.create({
       scheme: 'bacs',
       customer: customer.id,
@@ -393,8 +402,10 @@ app.post('/create-mandate', async (req, res) => {
         country_code: clientAddress.country
       }
     });
+    console.log('Page de mandat créée. ID du mandat :', mandatePages.mandate_id, 'URL de redirection :', mandatePages.url);
 
     // Créer le paiement récurrent
+    console.log('Création de l’abonnement GoCardless (prélèvement récurrent)...');
     const subscription = await gocardless.subscriptions.create({
       amount: amount * 100, // Convertir en centimes
       currency: currency,
@@ -406,6 +417,7 @@ app.post('/create-mandate', async (req, res) => {
         clientId: clientId
       }
     });
+    console.log('Abonnement GoCardless créé. ID de l’abonnement :', subscription.id);
 
     return res.json({
       success: true,
@@ -415,7 +427,7 @@ app.post('/create-mandate', async (req, res) => {
       subscriptionId: subscription.id
     });
   } catch (error) {
-    console.error('Error creating GoCardless mandate:', error);
+    console.error('Erreur lors de l’initialisation du prélèvement GoCardless:', error);
     return res.status(500).json({
       success: false,
       error: error.message
@@ -478,6 +490,76 @@ app.post('/create-payment', async (req, res) => {
   }
 });
 
+// Route pour lancer la signature d'un contrat avec Yousign
+app.post('/api/yousign/send-contract', async (req, res) => {
+  console.log('Body reçu pour signature Yousign:', req.body); // LOG DEBUG
+  try {
+    const { fileBase64, fileName, signerEmail, signerFirstname, signerLastname } = req.body;
+
+    // Vérification des champs obligatoires
+    if (!fileBase64 || !fileName || !signerEmail || !signerFirstname || !signerLastname) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Champs manquants pour la signature',
+        bodyRecu: req.body // Pour debug
+      });
+    }
+
+    const headers = {
+      'Authorization': `Bearer ${YOUSIGN_API_KEY}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    };
+
+    // 1. Upload du fichier
+    const fileResponse = await axios.post(
+      `${YOUSIGN_API_URL}/files`,
+      {
+        name: fileName,
+        nature: 'signable_document',
+        content: fileBase64
+      },
+      { headers }
+    );
+    const fileId = fileResponse.data.id;
+
+    // 2. Créer la procédure avec le fichier
+    const procedureResponse = await axios.post(
+      `${YOUSIGN_API_URL}/procedures`,
+      {
+        name: `Signature ${fileName}`,
+        description: 'Signature électronique du document',
+        start: true,
+        files: [{ id: fileId }],
+        members: [{
+          firstname: signerFirstname,
+          lastname: signerLastname,
+          email: signerEmail,
+          type: 'signer',
+          fileObjects: [{
+            file: fileId,
+            page: 1,
+            position: '230,499,464,589',
+            mention: 'Lu et approuvé'
+          }]
+        }]
+      },
+      { headers }
+    );
+
+    res.json({
+      success: true,
+      procedure: procedureResponse.data
+    });
+  } catch (error) {
+    console.error('Erreur Yousign:', error.response?.data || error.message);
+    res.status(500).json({
+      success: false,
+      error: error.response?.data || error.message
+    });
+  }
+});
+
 // Fonction pour démarrer le serveur
 function startServer(port) {
   return new Promise((resolve, reject) => {
@@ -501,4 +583,4 @@ const PORT = process.env.PORT || 10000;  // Utiliser le port 10000 par défaut
 startServer(PORT).catch(err => {
   console.error('Impossible de démarrer le serveur:', err);
   process.exit(1);
-}); 
+});
