@@ -7,8 +7,98 @@ const fs = require('fs');
 const gocardless = require('gocardless-nodejs');
 const cors = require('cors');
 const axios = require('axios');
-const YOUSIGN_API_URL = 'https://api-sandbox.yousign.com/v3';
-const YOUSIGN_API_KEY = process.env.YOUSIGN_API_KEY;
+const UNIVERSIGN_API_URL = 'https://195.154.178.198/v1'; // IP directe de l'API Universign // IP temporaire pour tester l'accessibilité
+const UNIVERSIGN_API_KEY = 'apikey_oQeBvBrw0zKllcnZMWwvmX0ogm';
+
+// Fonction de test de connexion pour diagnostiquer les problèmes de réseau
+async function testConnection() {
+  try {
+    // Test de connexion à un serveur public (Google)
+    const googleResponse = await axios.get('https://www.google.com');
+    console.log('Test de connexion réussi vers Google');
+  } catch (error) {
+    console.error('Erreur lors du test de connexion vers Google:', error);
+  }
+
+  try {
+    // Configuration du proxy depuis les variables d'environnement
+    const proxyConfig = {
+      host: process.env.HTTP_PROXY_HOST,
+      port: process.env.HTTP_PROXY_PORT,
+      auth: {
+        username: process.env.HTTP_PROXY_USERNAME,
+        password: process.env.HTTP_PROXY_PASSWORD
+      }
+    };
+
+    // Configuration Axios avec le proxy si défini
+    const config = {
+      headers: {
+        'Authorization': `Bearer ${UNIVERSIGN_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    };
+
+    if (proxyConfig.host) {
+      config.proxy = proxyConfig;
+      console.log('Proxy configuré:', proxyConfig);
+    }
+
+    // Test de connexion à l'API Universign
+    const response = await axios.get('https://api.universign.eu/v1/health', config);
+    console.log('Test de connexion réussi vers Universign:', response.data);
+  } catch (error) {
+    console.error('Erreur lors du test de connexion vers Universign:', error);
+    
+
+  }
+}
+
+// Fonction pour créer un contrat via Universign
+async function startUniversignSignature(pdfBase64, signerEmail, signerFirstname, signerLastname) {
+  try {
+    // Configuration du proxy depuis les variables d'environnement
+    const proxyConfig = process.env.HTTP_PROXY_HOST ? {
+      host: process.env.HTTP_PROXY_HOST,
+      port: process.env.HTTP_PROXY_PORT,
+      auth: {
+        username: process.env.HTTP_PROXY_USERNAME,
+        password: process.env.HTTP_PROXY_PASSWORD
+      }
+    } : null;
+
+    // Configuration Axios avec le proxy si défini
+    const config = {
+      headers: {
+        'Authorization': `Bearer ${UNIVERSIGN_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    };
+    
+    // Ajouter la configuration proxy si nécessaire
+    if (proxyConfig) {
+      config.proxy = proxyConfig;
+    }
+    const createContractResponse = await axios.post(`${UNIVERSIGN_API_URL}/contracts`, {
+      document: {
+        name: 'Contrat de signature',
+        content: pdfBase64
+      },
+      signers: [
+        {
+          email: signerEmail,
+          firstName: signerFirstname,
+          lastName: signerLastname,
+          role: 'signer'
+        }
+      ]
+    }, config);
+    return createContractResponse.data;
+  } catch (error) {
+    console.error('Erreur lors de la création du contrat Universign:', error);
+    throw error;
+  }
+}
 
 // Forcer le mode développement
 process.env.NODE_ENV = 'development';
@@ -496,13 +586,8 @@ app.post('/api/yousign/send-contract', async (req, res) => {
   try {
     const { fileBase64, fileName, signerEmail, signerFirstname, signerLastname } = req.body;
 
-    // Vérification des champs obligatoires
     if (!fileBase64 || !fileName || !signerEmail || !signerFirstname || !signerLastname) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Champs manquants pour la signature',
-        bodyRecu: req.body // Pour debug
-      });
+      return res.status(400).json({ success: false, error: 'Champs manquants pour la signature' });
     }
 
     const headers = {
@@ -511,76 +596,193 @@ app.post('/api/yousign/send-contract', async (req, res) => {
       'Accept': 'application/json'
     };
 
-    // 1. Upload du fichier
-    const fileResponse = await axios.post(
-      `${YOUSIGN_API_URL}/files`,
-      {
-        name: fileName,
-        nature: 'signable_document',
-        content: fileBase64
-      },
-      { headers }
-    );
-    const fileId = fileResponse.data.id;
-
-    // 2. Créer la procédure avec le fichier
-    const procedureResponse = await axios.post(
+    // 1. Créer la procédure
+    const procedureRes = await axios.post(
       `${YOUSIGN_API_URL}/procedures`,
       {
         name: `Signature ${fileName}`,
         description: 'Signature électronique du document',
-        start: true,
-        files: [{ id: fileId }],
-        members: [{
-          firstname: signerFirstname,
-          lastname: signerLastname,
-          email: signerEmail,
-          type: 'signer',
-          fileObjects: [{
-            file: fileId,
-            page: 1,
-            position: '230,499,464,589',
-            mention: 'Lu et approuvé'
-          }]
+        start: false
+      },
+      { headers }
+    );
+    const procedureId = procedureRes.data.id;
+    console.log('[YOUSIGN] Procédure créée:', procedureId);
+
+    // 2. Ajouter le document à la procédure
+    const documentRes = await axios.post(
+      `${YOUSIGN_API_URL}/procedures/${procedureId}/documents`,
+      {
+        name: fileName,
+        content: fileBase64,
+        contentType: 'application/pdf'
+      },
+      { headers }
+    );
+    const documentId = documentRes.data.id;
+    console.log('[YOUSIGN] Document ajouté:', documentId);
+
+    // 3. Ajouter le signataire
+    await axios.post(
+      `${YOUSIGN_API_URL}/procedures/${procedureId}/members`,
+      {
+        firstname: signerFirstname,
+        lastname: signerLastname,
+        email: signerEmail,
+        fileObjects: [{
+          document: documentId,
+          page: 1,
+          position: '230,499,464,589',
+          mention: 'Lu et approuvé'
         }]
       },
       { headers }
     );
+    console.log('[YOUSIGN] Membre ajouté');
+
+    // 4. Démarrer la procédure
+    await axios.post(
+      `${YOUSIGN_API_URL}/procedures/${procedureId}/start`,
+      {},
+      { headers }
+    );
+    console.log('[YOUSIGN] Procédure démarrée');
 
     res.json({
       success: true,
-      procedure: procedureResponse.data
+      procedureId
     });
   } catch (error) {
-    console.error('Erreur Yousign:', error.response?.data || error.message);
+    console.error('Erreur Yousign v3:', error.response?.data || error.message);
     res.status(500).json({
       success: false,
       error: error.response?.data || error.message
     });
   }
 });
+app.post('/api/universign/send-contract', async (req, res) => {
+  try {
+    const { fileBase64, signerEmail, signerFirstname, signerLastname } = req.body;
+    
+    // Validation des données
+    if (!fileBase64 || !signerEmail || !signerFirstname || !signerLastname) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        details: {
+          required: ['fileBase64', 'signerEmail', 'signerFirstname', 'signerLastname']
+        }
+      });
+    }
+
+    // Vérifier que le fichier est bien en base64
+    if (!Buffer.from(fileBase64, 'base64').toString('base64') === fileBase64) {
+      return res.status(400).json({
+        error: 'Invalid base64 file'
+      });
+    }
+
+    // Vérifier l'adresse email
+    if (!signerEmail.includes('@')) {
+      return res.status(400).json({
+        error: 'Invalid email address'
+      });
+    }
+
+    // Créer le contrat avec Universign
+    const result = await startUniversignSignature(fileBase64, signerEmail, signerFirstname, signerLastname);
+    
+    // Stocker les informations dans Firebase
+    const db = admin.firestore();
+    await db.collection('contracts').add({
+      signerEmail,
+      signerFirstname,
+      signerLastname,
+      contractId: result.contractId,
+      status: 'pending',
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      success: true,
+      data: result,
+      message: 'Contract sent successfully'
+    });
+  } catch (error) {
+    console.error('Error sending contract:', error);
+    res.status(500).json({
+      error: 'Error sending contract',
+      details: error.message
+    });
+  }
+});
 
 // Fonction pour démarrer le serveur
-function startServer(port) {
-  return new Promise((resolve, reject) => {
-    const server = app.listen(port, () => {
+async function startServer(port) {
+  try {
+    app.listen(port, () => {
       console.log(`Serveur démarré sur le port ${port}`);
-      resolve(server);
-    }).on('error', (err) => {
-      if (err.code === 'EADDRINUSE') {
-        console.log(`Le port ${port} est déjà utilisé, tentative avec le port ${port + 1}`);
-        startServer(port + 1).then(resolve).catch(reject);
-      } else {
-        console.error('Erreur lors du démarrage du serveur:', err);
-        reject(err);
-      }
     });
+  } catch (error) {
+    if (error.code === 'EADDRINUSE') {
+      // Calculer le prochain port valide (entre 3000 et 65535)
+      const nextPort = Math.min(port + 1, 65535);
+      if (nextPort <= 65535) {
+        console.log(`Le port ${port} est déjà utilisé, tentative avec le port ${nextPort}`);
+        await startServer(nextPort);
+      } else {
+        throw new Error('Aucun port disponible dans la plage 3000-65535');
+      }
+    } else if (error.code === 'ERR_SOCKET_BAD_PORT') {
+      // Si erreur de port invalide, essayer le port suivant
+      const nextPort = Math.min(port + 1, 65535);
+      console.log(`Port invalide (${port}), tentative avec le port ${nextPort}`);
+      await startServer(nextPort);
+    } else {
+      throw error;
+    }
+  }
+}
+
+// Fonction pour vérifier si un port est disponible
+async function isPortAvailable(port) {
+  return new Promise((resolve) => {
+    const server = require('net').createServer().listen(port, () => {
+      server.close(() => resolve(true));
+    }).on('error', () => resolve(false));
   });
 }
 
+// Fonction pour trouver un port disponible
+async function findAvailablePort(startPort = 10000) {
+  for (let port = startPort; port <= 65535; port++) {
+    if (await isPortAvailable(port)) {
+      return port;
+    }
+  }
+  throw new Error('Aucun port disponible dans la plage 10000-65535');
+}
+
 // Démarrer le serveur
-const PORT = process.env.PORT || 10000;  // Utiliser le port 10000 par défaut
-startServer(PORT).catch(err => {
-  console.error('Impossible de démarrer le serveur:', err);
-  process.exit(1);
-});
+async function start() {
+  try {
+    // D'abord trouver un port disponible
+    const port = await findAvailablePort(process.env.PORT || 10000);
+    console.log(`Port disponible trouvé: ${port}`);
+
+    // Effectuer le test de connexion
+    console.log('Démarrage du test de connexion...');
+    await testConnection().catch(err => {
+      console.error('Erreur lors du test de connexion:', err);
+    });
+
+    // Démarrer le serveur sur le port trouvé
+    await startServer(port);
+    console.log(`Serveur démarré sur le port ${port}`);
+  } catch (err) {
+    console.error('Erreur lors du démarrage:', err);
+    process.exit(1);
+  }
+}
+
+// Lancer le démarrage
+start();
