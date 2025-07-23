@@ -27,45 +27,25 @@ const universignApi = require('axios').create({
 // Fonction de test de connexion pour diagnostiquer les problèmes de réseau
 async function testConnection() {
   try {
-    // Tester la résolution DNS avec le résolveur personnalisé
+    // On retire la résolution DNS personnalisée (resolver)
+    // On tente directement la connexion à l'API Universign
     try {
-      const addresses = await resolver.resolve4('api.universign.eu');
-      console.log('Résolution DNS réussie pour api.universign.eu:', addresses);
-      
-      // Tester la connexion à l'API Universign avec l'IP résolue
+      // Test direct de connexion à l'API Universign
       const config = {
         headers: {
           'Authorization': `Bearer ${UNIVERSIGN_API_KEY}`,
-          'Host': 'api.universign.eu' // Important pour le SNI
+          'Host': 'api.universign.com'
         },
-        // Désactiver la vérification SSL pour le test
         httpsAgent: new (require('https').Agent)({  
           rejectUnauthorized: false,
-          servername: 'api.universign.eu' // SNI
+          servername: 'api.universign.com'
         })
       };
-      
-      const response = await axios.get('https://' + addresses[0] + '/v1/health', config);
+      const response = await axios.get('https://api.universign.com/v1/transactions', config);
       console.log('Connexion à Universign réussie !', response.status, response.statusText);
-      
     } catch (dnsError) {
-      console.error('Erreur de résolution DNS:', dnsError);
-      // Essayer avec l'IP directe en cas d'échec
-      console.log('Tentative de connexion avec l\'IP directe...');
-      
-      const response = await axios.get('https://195.154.178.198/v1/health', {
-        headers: {
-          'Host': 'api.universign.eu',
-          'Authorization': `Bearer ${UNIVERSIGN_API_KEY}`
-        },
-        httpsAgent: new (require('https').Agent)({  
-          rejectUnauthorized: false,
-          servername: 'api.universign.eu' // SNI
-        })
-      });
-      console.log('Connexion à Universign via IP directe réussie !', response.status);
+      console.error('Erreur de connexion directe à Universign:', dnsError);
     }
-    
   } catch (error) {
     console.error('Erreur lors du test de connexion:', error);
   }
@@ -95,12 +75,10 @@ async function testConnection() {
     }
 
     // Test de connexion à l'API Universign
-    const response = await axios.get('https://api.universign.eu/v1/health', config);
+    const response = await axios.get('https://api.universign.com/v1/transactions', config);
     console.log('Test de connexion réussi vers Universign:', response.data);
   } catch (error) {
     console.error('Erreur lors du test de connexion vers Universign:', error);
-    
-
   }
 }
 
@@ -672,87 +650,6 @@ app.post('/create-payment', async (req, res) => {
     res.status(500).json({
       error: 'Erreur lors de la création du paiement',
       details: error.message
-    });
-  }
-});
-
-// Route pour lancer la signature d'un contrat avec Yousign
-app.post('/api/yousign/send-contract', async (req, res) => {
-  console.log('Body reçu pour signature Yousign:', req.body); // LOG DEBUG
-  try {
-    const { fileBase64, fileName, signerEmail, signerFirstname, signerLastname } = req.body;
-
-    if (!fileBase64 || !fileName || !signerEmail || !signerFirstname || !signerLastname) {
-      return res.status(400).json({ success: false, error: 'Champs manquants pour la signature' });
-    }
-
-    const headers = {
-      'Authorization': `Bearer ${YOUSIGN_API_KEY}`,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    };
-
-    // 1. Créer la procédure
-    const procedureRes = await axios.post(
-      `${YOUSIGN_API_URL}/procedures`,
-      {
-        name: `Signature ${fileName}`,
-        description: 'Signature électronique du document',
-        start: false
-      },
-      { headers }
-    );
-    const procedureId = procedureRes.data.id;
-    console.log('[YOUSIGN] Procédure créée:', procedureId);
-
-    // 2. Ajouter le document à la procédure
-    const documentRes = await axios.post(
-      `${YOUSIGN_API_URL}/procedures/${procedureId}/documents`,
-      {
-        name: fileName,
-        content: fileBase64,
-        contentType: 'application/pdf'
-      },
-      { headers }
-    );
-    const documentId = documentRes.data.id;
-    console.log('[YOUSIGN] Document ajouté:', documentId);
-
-    // 3. Ajouter le signataire
-    await axios.post(
-      `${YOUSIGN_API_URL}/procedures/${procedureId}/members`,
-      {
-        firstname: signerFirstname,
-        lastname: signerLastname,
-        email: signerEmail,
-        fileObjects: [{
-          document: documentId,
-          page: 1,
-          position: '230,499,464,589',
-          mention: 'Lu et approuvé'
-        }]
-      },
-      { headers }
-    );
-    console.log('[YOUSIGN] Membre ajouté');
-
-    // 4. Démarrer la procédure
-    await axios.post(
-      `${YOUSIGN_API_URL}/procedures/${procedureId}/start`,
-      {},
-      { headers }
-    );
-    console.log('[YOUSIGN] Procédure démarrée');
-
-    res.json({
-      success: true,
-      procedureId
-    });
-  } catch (error) {
-    console.error('Erreur Yousign v3:', error.response?.data || error.message);
-    res.status(500).json({
-      success: false,
-      error: error.response?.data || error.message
     });
   }
 });
