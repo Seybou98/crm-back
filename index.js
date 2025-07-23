@@ -7,17 +7,67 @@ const fs = require('fs');
 const gocardless = require('gocardless-nodejs');
 const cors = require('cors');
 const axios = require('axios');
-const UNIVERSIGN_API_URL = 'https://195.154.178.198/v1'; // IP directe de l'API Universign // IP temporaire pour tester l'accessibilité
+// Configuration de l'API Universign
+const UNIVERSIGN_API_BASE_URL = 'https://api.universign.com/v1';
 const UNIVERSIGN_API_KEY = 'apikey_oQeBvBrw0zKllcnZMWwvmX0ogm';
+
+// Configuration Axios pour l'API Universign
+const universignApi = require('axios').create({
+  baseURL: UNIVERSIGN_API_BASE_URL,
+  headers: {
+    'Authorization': `Bearer ${UNIVERSIGN_API_KEY}`,
+    'Content-Type': 'application/json'
+  },
+  // Désactiver la vérification SSL pour le développement
+  httpsAgent: new (require('https').Agent)({  
+    rejectUnauthorized: false
+  })
+});
 
 // Fonction de test de connexion pour diagnostiquer les problèmes de réseau
 async function testConnection() {
   try {
-    // Test de connexion à un serveur public (Google)
-    const googleResponse = await axios.get('https://www.google.com');
-    console.log('Test de connexion réussi vers Google');
+    // Tester la résolution DNS avec le résolveur personnalisé
+    try {
+      const addresses = await resolver.resolve4('api.universign.eu');
+      console.log('Résolution DNS réussie pour api.universign.eu:', addresses);
+      
+      // Tester la connexion à l'API Universign avec l'IP résolue
+      const config = {
+        headers: {
+          'Authorization': `Bearer ${UNIVERSIGN_API_KEY}`,
+          'Host': 'api.universign.eu' // Important pour le SNI
+        },
+        // Désactiver la vérification SSL pour le test
+        httpsAgent: new (require('https').Agent)({  
+          rejectUnauthorized: false,
+          servername: 'api.universign.eu' // SNI
+        })
+      };
+      
+      const response = await axios.get('https://' + addresses[0] + '/v1/health', config);
+      console.log('Connexion à Universign réussie !', response.status, response.statusText);
+      
+    } catch (dnsError) {
+      console.error('Erreur de résolution DNS:', dnsError);
+      // Essayer avec l'IP directe en cas d'échec
+      console.log('Tentative de connexion avec l\'IP directe...');
+      
+      const response = await axios.get('https://195.154.178.198/v1/health', {
+        headers: {
+          'Host': 'api.universign.eu',
+          'Authorization': `Bearer ${UNIVERSIGN_API_KEY}`
+        },
+        httpsAgent: new (require('https').Agent)({  
+          rejectUnauthorized: false,
+          servername: 'api.universign.eu' // SNI
+        })
+      });
+      console.log('Connexion à Universign via IP directe réussie !', response.status);
+    }
+    
   } catch (error) {
-    console.error('Erreur lors du test de connexion vers Google:', error);
+    console.error('Erreur lors du test de connexion:', error);
   }
 
   try {
@@ -54,49 +104,95 @@ async function testConnection() {
   }
 }
 
-// Fonction pour créer un contrat via Universign
-async function startUniversignSignature(pdfBase64, signerEmail, signerFirstname, signerLastname) {
+// Fonction pour démarrer une transaction de signature avec Universign
+async function startUniversignSignature(documentBase64, signerEmail, signerName, signerPhone, fileName, callback) {
   try {
-    // Configuration du proxy depuis les variables d'environnement
-    const proxyConfig = process.env.HTTP_PROXY_HOST ? {
-      host: process.env.HTTP_PROXY_HOST,
-      port: process.env.HTTP_PROXY_PORT,
-      auth: {
-        username: process.env.HTTP_PROXY_USERNAME,
-        password: process.env.HTTP_PROXY_PASSWORD
-      }
-    } : null;
-
-    // Configuration Axios avec le proxy si défini
-    const config = {
-      headers: {
-        'Authorization': `Bearer ${UNIVERSIGN_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
-    };
-    
-    // Ajouter la configuration proxy si nécessaire
-    if (proxyConfig) {
-      config.proxy = proxyConfig;
-    }
-    const createContractResponse = await axios.post(`${UNIVERSIGN_API_URL}/contracts`, {
-      document: {
-        name: 'Contrat de signature',
-        content: pdfBase64
-      },
-      signers: [
+    // Préparation du document pour la signature
+    const document = {
+      content: documentBase64,
+      name: fileName || 'document.pdf',
+      title: fileName || 'Document à signer',
+      signatureFields: [
         {
-          email: signerEmail,
-          firstName: signerFirstname,
-          lastName: signerLastname,
-          role: 'signer'
+          page: 1,
+          x: 50,  // Position X sur la page
+          y: 700, // Position Y sur la page
+          name: 'signature',
+          signerIndex: 0
         }
       ]
-    }, config);
-    return createContractResponse.data;
+    };
+
+    // Préparation du signataire
+    const signer = {
+      email: signerEmail,
+      firstname: signerName.split(' ')[0],
+      lastname: signerName.split(' ').slice(1).join(' ') || '.', // Au moins un caractère requis
+      phone: signerPhone,
+      successURL: 'https://votresite.com/success', // À personnaliser
+      cancelURL: 'https://votresite.com/cancel',   // À personnaliser
+      failURL: 'https://votresite.com/error',      // À personnaliser
+      certificateType: 'simple',
+      signatureField: {
+        name: 'signature',
+        height: 30,
+        width: 100
+      }
+    };
+
+    // Création de la transaction
+    const transaction = {
+      documents: [document],
+      signers: [signer],
+      mustContactFirstSigner: false,
+      finalDocRequesterSent: false,
+      finalDocSent: false,
+      finalDocRequesterMessage: 'Merci pour votre signature',
+      finalDocSentMessage: 'Votre document signé est disponible en pièce jointe',
+      description: 'Signature de document',
+      customId: `sign_${Date.now()}`,
+      successURL: 'https://votresite.com/success', // À personnaliser
+      cancelURL: 'https://votresite.com/cancel',   // À personnaliser
+      failURL: 'https://votresite.com/error',      // À personnaliser
+      language: 'fr'
+    };
+
+    // Envoi de la requête à l'API Universign
+    const response = await universignApi.post('/transactions', transaction);
+    
+    if (!response.data || !response.data.id) {
+      throw new Error('Réponse invalide de l\'API Universign');
+    }
+
+    // Enregistrement de la transaction dans Firestore
+    const signatureRequestRef = await admin.firestore().collection('signatureRequests').add({
+      universignId: response.data.id,
+      documentName: fileName,
+      signerEmail: signerEmail,
+      status: 'pending',
+      customId: transaction.customId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Démarrage de la transaction
+    await universignApi.post(`/transactions/${response.data.id}/start`);
+
+    // Retour des informations de la transaction
+    callback(null, {
+      signatureRequestId: signatureRequestRef.id,
+      universignId: response.data.id,
+      customId: transaction.customId,
+      status: 'pending',
+      // L'URL de redirection sera disponible dans la réponse de l'API
+      // ou via une requête GET sur /transactions/{id}
+    });
+
   } catch (error) {
-    console.error('Erreur lors de la création du contrat Universign:', error);
-    throw error;
+    console.error('Erreur lors de la création de la transaction Universign:', error.response?.data || error.message);
+    callback({
+      message: 'Erreur lors de la création de la transaction',
+      details: error.response?.data || error.message
+    }, null);
   }
 }
 
@@ -660,61 +756,112 @@ app.post('/api/yousign/send-contract', async (req, res) => {
     });
   }
 });
+
+// Endpoint pour envoyer un contrat à signer via Universign
 app.post('/api/universign/send-contract', async (req, res) => {
   try {
-    const { fileBase64, signerEmail, signerFirstname, signerLastname } = req.body;
-    
-    // Validation des données
-    if (!fileBase64 || !signerEmail || !signerFirstname || !signerLastname) {
-      return res.status(400).json({
-        error: 'Missing required fields',
-        details: {
-          required: ['fileBase64', 'signerEmail', 'signerFirstname', 'signerLastname']
-        }
-      });
+    const { pdfBase64, signerEmail, signerName, signerPhone, fileName } = req.body;
+
+    if (!pdfBase64 || !signerEmail || !signerName) {
+      return res.status(400).json({ error: 'Tous les champs sont obligatoires' });
     }
 
-    // Vérifier que le fichier est bien en base64
-    if (!Buffer.from(fileBase64, 'base64').toString('base64') === fileBase64) {
-      return res.status(400).json({
-        error: 'Invalid base64 file'
-      });
-    }
-
-    // Vérifier l'adresse email
-    if (!signerEmail.includes('@')) {
-      return res.status(400).json({
-        error: 'Invalid email address'
-      });
-    }
-
-    // Créer le contrat avec Universign
-    const result = await startUniversignSignature(fileBase64, signerEmail, signerFirstname, signerLastname);
-    
-    // Stocker les informations dans Firebase
-    const db = admin.firestore();
-    await db.collection('contracts').add({
-      signerEmail,
-      signerFirstname,
-      signerLastname,
-      contractId: result.contractId,
-      status: 'pending',
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    res.json({
-      success: true,
-      data: result,
-      message: 'Contract sent successfully'
+    startUniversignSignature(pdfBase64, signerEmail, signerName, signerPhone || '', fileName || 'document.pdf', (error, result) => {
+      if (error) {
+        console.error('Erreur lors de la création de la signature:', error);
+        return res.status(500).json({ 
+          error: 'Erreur lors de la création de la signature',
+          details: error.details || error.message 
+        });
+      }
+      
+      res.json(result);
     });
   } catch (error) {
-    console.error('Error sending contract:', error);
-    res.status(500).json({
-      error: 'Error sending contract',
-      details: error.message
+    console.error('Erreur inattendue:', error);
+    res.status(500).json({ 
+      error: 'Erreur lors du traitement de la demande',
+      details: error.message 
     });
   }
 });
+
+// Webhook pour recevoir les mises à jour de statut d'Universign
+app.post('/api/universign/webhook', async (req, res) => {
+  try {
+    const { event, data } = req.body;
+    
+    if (!event || !data || !data.transactionId) {
+      console.warn('Requête de webhook invalide:', { event, data });
+      return res.status(400).json({ error: 'Requête invalide' });
+    }
+
+    console.log(`Reçu un événement ${event} pour la transaction ${data.transactionId}`);
+
+    // Mettre à jour le statut dans Firestore
+    const snapshot = await admin.firestore()
+      .collection('signatureRequests')
+      .where('universignId', '==', data.transactionId)
+      .limit(1)
+      .get();
+
+    if (!snapshot.empty) {
+      const doc = snapshot.docs[0];
+      await doc.ref.update({
+        status: event,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        [`events.${event}`]: admin.firestore.FieldValue.serverTimestamp(),
+        ...(data.signatureUrl && { signedDocumentUrl: data.signatureUrl })
+      });
+      
+      console.log(`Mise à jour du statut pour la transaction ${data.transactionId}: ${event}`);
+    } else {
+      console.warn(`Transaction non trouvée: ${data.transactionId}`);
+    }
+
+    res.status(200).json({ received: true });
+  } catch (error) {
+    console.error('Erreur lors du traitement du webhook:', error);
+    res.status(500).json({ error: 'Erreur lors du traitement du webhook' });
+  }
+});
+
+// Endpoint pour vérifier le statut d'une transaction
+app.get('/api/universign/status/:transactionId', async (req, res) => {
+  try {
+    const { transactionId } = req.params;
+    
+    // Récupérer les informations de la transaction depuis Firestore
+    const snapshot = await admin.firestore()
+      .collection('signatureRequests')
+      .where('universignId', '==', transactionId)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.status(404).json({ error: 'Transaction non trouvée' });
+    }
+
+    const doc = snapshot.docs[0].data();
+    res.json({
+      transactionId,
+      status: doc.status,
+      documentName: doc.documentName,
+      signerEmail: doc.signerEmail,
+      createdAt: doc.createdAt?.toDate()?.toISOString(),
+      updatedAt: doc.updatedAt?.toDate()?.toISOString(),
+      signedDocumentUrl: doc.signedDocumentUrl
+    });
+  } catch (error) {
+    console.error('Erreur lors de la récupération du statut:', error);
+    res.status(500).json({ 
+      error: 'Erreur lors de la récupération du statut',
+      details: error.message 
+    });
+  }
+});
+
+// Suppression du code en double qui causait des erreurs de syntaxe
 
 // Fonction pour démarrer le serveur
 async function startServer(port) {
