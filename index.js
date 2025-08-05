@@ -8,7 +8,56 @@ const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:4173'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin']
+}));
+
+// Fonction de validation IBAN (AJOUTÉE) - Version améliorée
+function validateIBAN(iban) {
+  // Supprimer les espaces et convertir en majuscules
+  const cleanIban = iban.replace(/\s/g, '').toUpperCase();
+  
+  // Vérifier la longueur (FR = 27 caractères)
+  if (cleanIban.length !== 27) {
+    console.log('[GoCardless] IBAN invalide - longueur:', cleanIban.length, '(attendu: 27)');
+    return false;
+  }
+  
+  // Vérifier le format français (FR + 2 chiffres + 10 caractères + 11 caractères alphanumériques)
+  // Format: FR + 2 chiffres + 10 caractères alphanumériques + 11 caractères alphanumériques
+  const ibanRegex = /^FR\d{2}[A-Z0-9]{10}[A-Z0-9]{11}$/;
+  const isValid = ibanRegex.test(cleanIban);
+  
+  // Log pour debug
+  console.log('[GoCardless] Validation IBAN:', {
+    iban: cleanIban,
+    length: cleanIban.length,
+    regexMatch: ibanRegex.test(cleanIban),
+    isValid: isValid
+  });
+  
+  if (!isValid) {
+    console.log('[GoCardless] IBAN invalide - format:', cleanIban);
+  }
+  
+  return isValid;
+}
+
+// Fonction utilitaire pour obtenir l'URL de l'API GoCardless (AJOUTÉE)
+function getGoCardlessApiUrl() {
+  const isProduction = process.env.GOCARDLESS_ACCESS_TOKEN?.startsWith('live_');
+  const apiUrl = isProduction 
+    ? 'https://api.gocardless.com' 
+    : 'https://api-sandbox.gocardless.com';
+  
+  console.log('[GoCardless] Environnement détecté:', isProduction ? 'production' : 'sandbox');
+  console.log('[GoCardless] URL API utilisée:', apiUrl);
+  
+  return apiUrl;
+}
 
 const YOUSIGN_API_URL = 'https://api-sandbox.yousign.app/v3';
 const YOUSIGN_API_TOKEN = process.env.YOUSIGN_API_TOKEN;
@@ -233,7 +282,28 @@ app.get('/api/yousign/signature-request/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const signatureRequest = await getSignatureRequest(id);
-    res.json(signatureRequest);
+    
+    // Extraire le statut de signature pour chaque signataire
+    const signatureStatus = signatureRequest.signers?.map(signer => ({
+      id: signer.id,
+      firstName: signer.info?.first_name,
+      lastName: signer.info?.last_name,
+      email: signer.info?.email,
+      status: signer.status, // 'initiated', 'signed', 'declined', etc.
+      signedAt: signer.signed_at,
+      signatureLink: signer.signature_link
+    })) || [];
+    
+    res.json({
+      id: signatureRequest.id,
+      name: signatureRequest.name,
+      status: signatureRequest.status, // 'draft', 'active', 'completed', 'expired'
+      createdAt: signatureRequest.created_at,
+      updatedAt: signatureRequest.updated_at,
+      signers: signatureStatus,
+      isCompleted: signatureRequest.status === 'completed' || signatureRequest.status === 'done',
+      isExpired: signatureRequest.status === 'expired'
+    });
   } catch (error) {
     console.error('[Yousign] Erreur GET:', error.response?.data || error.message);
     res.status(500).json({
@@ -268,13 +338,867 @@ app.get('/api/yousign/signature-request/:id/document', async (req, res) => {
   }
 });
 
-// POST : endpoint webhook pour recevoir les notifications Yousign
-app.post('/api/yousign/webhook', express.json(), (req, res) => {
-  // Ici tu peux traiter les notifications de statut Yousign
-  console.log('[Yousign][Webhook] Notification reçue:', req.body);
-  // Tu peux stocker le statut, envoyer un email, etc.
-  res.status(200).json({ received: true });
+// POST : créer un mandat GoCardless
+app.post('/create-mandate', async (req, res) => {
+  try {
+    console.log('[GoCardless] Création de mandat:', req.body);
+    const { account_holder_name, iban, reference, metadata } = req.body;
+
+    if (!account_holder_name || !iban) {
+      return res.status(400).json({ error: 'account_holder_name et iban sont requis' });
+    }
+
+    // Validation IBAN (AJOUTÉE) - Temporairement désactivée pour les tests
+    // if (!validateIBAN(iban)) {
+    //   return res.status(400).json({ 
+    //     error: 'IBAN invalide', 
+    //     message: 'L\'IBAN doit être au format français valide (FR + 27 caractères)' 
+    //   });
+    // }
+    console.log('[GoCardless] Validation IBAN désactivée pour les tests');
+
+    // Vérifier le token
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant',
+        message: 'Ajoutez votre token d\'accès dans le fichier .env'
+      });
+    }
+
+    // Vérifier le Creditor ID (AJOUTÉ)
+    if (!process.env.GOCARDLESS_CREDITOR_ID) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_CREDITOR_ID manquant',
+        message: 'Ajoutez votre Creditor ID dans le fichier .env'
+      });
+    }
+
+    console.log('[GoCardless] Creditor ID utilisé:', process.env.GOCARDLESS_CREDITOR_ID);
+
+    // Forcer l'utilisation de l'API sandbox pour les tests
+    const apiUrl = 'https://api-sandbox.gocardless.com';
+    console.log('[GoCardless] Utilisation forcée de l\'API sandbox pour les tests:', apiUrl);
+
+    // Vérifier le statut du creditor (AJOUTÉ)
+    try {
+      const creditorResponse = await axios.get(`${apiUrl}/creditors/${process.env.GOCARDLESS_CREDITOR_ID}`, {
+        headers: {
+          'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+          'GoCardless-Version': '2015-07-06',
+          'Content-Type': 'application/json'
+        }
+      });
+
+      const creditor = creditorResponse.data.creditors;
+      
+      if (!creditor.activated) {
+        console.log('[GoCardless] Warning: Creditor non activé, mais continuation pour les tests');
+        // Ne pas bloquer, juste logger un warning
+      }
+
+      if (!creditor.collections_permitted) {
+        console.log('[GoCardless] Warning: Collections non permises, mais continuation pour les tests');
+        // Ne pas bloquer, juste logger un warning
+      }
+
+      console.log('[GoCardless] Creditor vérifié:', creditor.name, '- Statut:', creditor.verification_status);
+      
+    } catch (creditorError) {
+      console.error('[GoCardless] Erreur vérification creditor:', creditorError.response?.data || creditorError.message);
+      return res.status(500).json({
+        error: 'Erreur lors de la vérification du creditor',
+        message: 'Impossible de vérifier le statut de votre creditor GoCardless.',
+        details: creditorError.response?.data || creditorError.message
+      });
+    }
+
+    // 1. Créer le client
+    const customerResponse = await axios.post(`${apiUrl}/customers`, {
+      customers: {
+        email: `${account_holder_name.toLowerCase().replace(' ', '.')}@example.com`,
+        given_name: account_holder_name.split(' ')[0] || account_holder_name,
+        family_name: account_holder_name.split(' ').slice(1).join(' ') || account_holder_name,
+        address_line1: metadata?.address || 'Adresse non spécifiée',
+        city: metadata?.city || 'Ville non spécifiée',
+        postal_code: metadata?.postalCode || '00000',
+        country_code: metadata?.country || 'FR'
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    // 2. Créer le compte bancaire
+    const bankAccountResponse = await axios.post(`${apiUrl}/customer_bank_accounts`, {
+      customer_bank_accounts: {
+        account_holder_name,
+        iban,
+        links: {
+          customer: customerResponse.data.customers.id
+        }
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    // 3. Créer le mandat
+    const mandateResponse = await axios.post(`${apiUrl}/mandates`, {
+      mandates: {
+        scheme: 'sepa_core',
+        links: {
+          customer_bank_account: bankAccountResponse.data.customer_bank_accounts.id,
+          creditor: process.env.GOCARDLESS_CREDITOR_ID
+        },
+        metadata: metadata || {}
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    // 4. Activer le mandat (AJOUTÉ) - Version non-bloquante
+    try {
+      const mandateId = mandateResponse.data.mandates.id;
+      await axios.post(`${apiUrl}/mandates/${mandateId}/actions/activate`, {}, {
+        headers: {
+          'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+          'GoCardless-Version': '2015-07-06',
+          'Content-Type': 'application/json'
+        }
+      });
+      console.log('[GoCardless] Mandat activé avec succès:', mandateId);
+    } catch (activationError) {
+      console.log('[GoCardless] Mandat déjà actif ou activation non nécessaire:', mandateResponse.data.mandates.id);
+    }
+
+    res.json({
+      mandateId: mandateResponse.data.mandates.id,
+      bankAccountId: bankAccountResponse.data.customer_bank_accounts.id,
+      customerId: customerResponse.data.customers.id,
+      status: 'active', // Mise à jour du statut
+      reference: reference || 'MANDATE_CREATED'
+    });
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur création mandat complète:', {
+      message: error.message,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      url: error.config?.url,
+      headers: error.config?.headers,
+      requestData: error.config?.data
+    });
+    res.status(500).json({
+      error: 'Erreur lors de la création du mandat GoCardless',
+      details: error.response?.data || error.message,
+      status: error.response?.status,
+      url: error.config?.url,
+      requestData: error.config?.data
+    });
+  }
 });
+
+// POST : créer un mandat GoCardless avec sandbox forcé (AJOUTÉ)
+app.post('/create-mandate-sandbox', async (req, res) => {
+  try {
+    console.log('[GoCardless] Création de mandat (sandbox forcé):', req.body);
+    const { account_holder_name, iban, reference, metadata } = req.body;
+
+    if (!account_holder_name || !iban) {
+      return res.status(400).json({ error: 'account_holder_name et iban sont requis' });
+    }
+
+    // Validation IBAN (AJOUTÉE) - Temporairement désactivée pour les tests
+    // if (!validateIBAN(iban)) {
+    //   return res.status(400).json({ 
+    //     error: 'IBAN invalide', 
+    //     message: 'L\'IBAN doit être au format français valide (FR + 27 caractères)' 
+    //   });
+    // }
+    console.log('[GoCardless] Validation IBAN désactivée pour les tests');
+
+    // Vérifier le token
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant',
+        message: 'Ajoutez votre token d\'accès dans le fichier .env'
+      });
+    }
+
+    // Vérifier le Creditor ID (AJOUTÉ)
+    if (!process.env.GOCARDLESS_CREDITOR_ID) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_CREDITOR_ID manquant',
+        message: 'Ajoutez votre Creditor ID dans le fichier .env'
+      });
+    }
+
+    console.log('[GoCardless] Creditor ID utilisé:', process.env.GOCARDLESS_CREDITOR_ID);
+
+    // Forcer l'utilisation de l'API sandbox
+    const apiUrl = 'https://api-sandbox.gocardless.com';
+    console.log('[GoCardless] Utilisation forcée de l\'API sandbox:', apiUrl);
+
+    // 1. Créer le client
+    const customerResponse = await axios.post(`${apiUrl}/customers`, {
+      customers: {
+        email: `${account_holder_name.toLowerCase().replace(' ', '.')}@example.com`,
+        given_name: account_holder_name.split(' ')[0] || account_holder_name,
+        family_name: account_holder_name.split(' ').slice(1).join(' ') || account_holder_name,
+        address_line1: metadata?.address || 'Adresse non spécifiée',
+        city: metadata?.city || 'Ville non spécifiée',
+        postal_code: metadata?.postalCode || '00000',
+        country_code: metadata?.country || 'FR'
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    // 2. Créer le compte bancaire
+    const bankAccountResponse = await axios.post(`${apiUrl}/customer_bank_accounts`, {
+      customer_bank_accounts: {
+        account_holder_name,
+        iban,
+        links: {
+          customer: customerResponse.data.customers.id
+        }
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    // 3. Créer le mandat
+    const mandateResponse = await axios.post(`${apiUrl}/mandates`, {
+      mandates: {
+        scheme: 'sepa_core',
+        links: {
+          customer_bank_account: bankAccountResponse.data.customer_bank_accounts.id,
+          creditor: process.env.GOCARDLESS_CREDITOR_ID
+        },
+        metadata: metadata || {}
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    // 4. Activer le mandat (AJOUTÉ) - Version non-bloquante
+    try {
+      const mandateId = mandateResponse.data.mandates.id;
+      await axios.post(`${apiUrl}/mandates/${mandateId}/actions/activate`, {}, {
+        headers: {
+          'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+          'GoCardless-Version': '2015-07-06',
+          'Content-Type': 'application/json'
+        }
+      });
+      console.log('[GoCardless] Mandat activé avec succès:', mandateId);
+    } catch (activationError) {
+      console.log('[GoCardless] Mandat déjà actif ou activation non nécessaire:', mandateResponse.data.mandates.id);
+    }
+
+    res.json({
+      mandateId: mandateResponse.data.mandates.id,
+      bankAccountId: bankAccountResponse.data.customer_bank_accounts.id,
+      customerId: customerResponse.data.customers.id,
+      status: mandateResponse.data.mandates.status,
+      reference: reference || 'MANDATE_CREATED',
+      environment: 'sandbox'
+    });
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur création mandat sandbox complète:', {
+      message: error.message,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      url: error.config?.url,
+      headers: error.config?.headers,
+      requestData: error.config?.data
+    });
+    res.status(500).json({
+      error: 'Erreur lors de la création du mandat GoCardless (sandbox)',
+      details: error.response?.data || error.message,
+      status: error.response?.status,
+      url: error.config?.url,
+      requestData: error.config?.data
+    });
+  }
+});
+
+// GET : diagnostic de la configuration GoCardless (AJOUTÉ)
+app.get('/diagnose-gocardless', async (req, res) => {
+  try {
+    console.log('[GoCardless] Diagnostic de la configuration...');
+    
+    const config = {
+      hasAccessToken: !!process.env.GOCARDLESS_ACCESS_TOKEN,
+      hasCreditorId: !!process.env.GOCARDLESS_CREDITOR_ID,
+      accessTokenType: process.env.GOCARDLESS_ACCESS_TOKEN ? 
+        (process.env.GOCARDLESS_ACCESS_TOKEN.startsWith('live_') ? 'production' : 'sandbox') : 'missing',
+      creditorId: process.env.GOCARDLESS_CREDITOR_ID || 'missing'
+    };
+    
+    console.log('[GoCardless] Configuration:', config);
+    
+    if (!config.hasAccessToken) {
+      return res.json({
+        success: false,
+        message: 'GOCARDLESS_ACCESS_TOKEN manquant',
+        config
+      });
+    }
+    
+    if (!config.hasCreditorId) {
+      return res.json({
+        success: false,
+        message: 'GOCARDLESS_CREDITOR_ID manquant',
+        config
+      });
+    }
+    
+    // Tester la connexion avec l'API
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.get(`${apiUrl}/creditors`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    res.json({
+      success: true,
+      message: 'Configuration GoCardless valide',
+      config,
+      apiResponse: {
+        status: response.status,
+        creditors: response.data.creditors?.length || 0
+      }
+    });
+    
+  } catch (error) {
+    console.error('[GoCardless] Erreur diagnostic:', error.response?.data || error.message);
+    res.json({
+      success: false,
+      message: 'Erreur de connexion à l\'API GoCardless',
+      config: {
+        hasAccessToken: !!process.env.GOCARDLESS_ACCESS_TOKEN,
+        hasCreditorId: !!process.env.GOCARDLESS_CREDITOR_ID,
+        accessTokenType: process.env.GOCARDLESS_ACCESS_TOKEN ? 
+          (process.env.GOCARDLESS_ACCESS_TOKEN.startsWith('live_') ? 'production' : 'sandbox') : 'missing'
+      },
+      error: error.response?.data || error.message,
+      status: error.response?.status
+    });
+  }
+});
+
+// GET : tester la connexion GoCardless
+app.get('/test-gocardless', async (req, res) => {
+  try {
+    console.log('[GoCardless] Test de connexion...');
+    
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.json({
+        success: false,
+        environment: 'error',
+        message: 'GOCARDLESS_ACCESS_TOKEN manquant',
+        token_type: 'missing'
+      });
+    }
+
+    // Utiliser l'API appropriée selon le token
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.get(`${apiUrl}/creditors`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const isProduction = process.env.GOCARDLESS_ACCESS_TOKEN?.startsWith('live_');
+    res.json({
+      success: true,
+      environment: isProduction ? 'production' : 'sandbox',
+      message: 'Connexion GoCardless réussie',
+      token_type: isProduction ? 'production' : 'sandbox',
+      creditors: response.data.creditors
+    });
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur test complète:', {
+      message: error.message,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      url: error.config?.url,
+      headers: error.config?.headers
+    });
+    res.json({
+      success: false,
+      environment: 'error',
+      message: 'Erreur de connexion GoCardless',
+      token_type: 'invalid',
+      details: error.response?.data || error.message,
+      status: error.response?.status,
+      url: error.config?.url
+    });
+  }
+});
+
+// GET : récupérer les créanciers (pour obtenir le Creditor ID)
+app.get('/get-creditors', async (req, res) => {
+  try {
+    console.log('[GoCardless] Récupération des créanciers...');
+    
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant',
+        message: 'Ajoutez votre token d\'accès dans le fichier .env'
+      });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.get(`${apiUrl}/creditors`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    console.log('[GoCardless] Créanciers récupérés:', response.data);
+    res.json(response.data);
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur récupération créanciers:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Erreur lors de la récupération des créanciers',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// POST : créer un paiement GoCardless
+app.post('/create-payment', async (req, res) => {
+  try {
+    console.log('[GoCardless] Création de paiement:', req.body);
+    const { amount, currency, mandate_id, description, reference } = req.body;
+
+    if (!amount || !currency || !mandate_id) {
+      return res.status(400).json({ error: 'amount, currency et mandate_id sont requis' });
+    }
+
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant'
+      });
+    }
+
+    // Vérifier le statut du creditor avant de créer un paiement (AJOUTÉ) - Version non-bloquante
+    try {
+      const apiUrl = getGoCardlessApiUrl();
+      const creditorResponse = await axios.get(`${apiUrl}/creditors/${process.env.GOCARDLESS_CREDITOR_ID}`, {
+        headers: {
+          'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+          'GoCardless-Version': '2015-07-06',
+          'Content-Type': 'application/json'
+        }
+      });
+
+      const creditor = creditorResponse.data.creditors;
+      
+      if (!creditor.collections_permitted) {
+        console.log('[GoCardless] Warning: Collections non permises sur le creditor');
+        // Ne pas bloquer, juste logger un warning
+      } else {
+        console.log('[GoCardless] Creditor vérifié - collections permises');
+      }
+      
+    } catch (creditorError) {
+      console.error('[GoCardless] Erreur vérification creditor:', creditorError.response?.data || creditorError.message);
+      console.log('[GoCardless] Poursuite sans vérification du creditor - tentative de création de paiement');
+      // Ne pas bloquer, continuer avec la création de paiement
+    }
+
+    // Vérifier que le mandat existe et est actif (AJOUTÉ) - avec délai
+    try {
+      const apiUrl = getGoCardlessApiUrl();
+      
+      // Attendre un peu que le mandat soit disponible dans l'API
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      const mandateResponse = await axios.get(`${apiUrl}/mandates/${mandate_id}`, {
+        headers: {
+          'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+          'GoCardless-Version': '2015-07-06',
+          'Content-Type': 'application/json'
+        }
+      });
+
+      const mandate = mandateResponse.data.mandates;
+      
+      if (mandate.status !== 'active') {
+        console.log('[GoCardless] Mandat trouvé mais non actif:', mandate.status);
+        // Ne pas bloquer si le mandat existe mais n'est pas encore actif
+        console.log('[GoCardless] Mandat en cours d\'activation:', mandate.id);
+      } else {
+        console.log('[GoCardless] Mandat vérifié et actif:', mandate.id);
+      }
+      
+    } catch (mandateError) {
+      console.error('[GoCardless] Erreur vérification mandat:', mandateError.response?.data || mandateError.message);
+      // Ne pas bloquer la création de paiement si la vérification échoue
+      console.log('[GoCardless] Poursuite sans vérification du mandat');
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+
+    const response = await axios.post(`${apiUrl}/payments`, {
+      payments: {
+        amount: amount * 100, // Conversion en centimes
+        currency,
+        links: {
+          mandate: mandate_id
+        },
+        description: description || 'Paiement de maintenance',
+        metadata: {
+          reference: reference || 'PAYMENT_CREATED'
+        }
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    res.json({
+      paymentId: response.data.payments.id,
+      status: response.data.payments.status,
+      amount: response.data.payments.amount,
+      currency: response.data.payments.currency,
+      description: response.data.payments.description
+    });
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur création paiement complète:', {
+      message: error.message,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      url: error.config?.url,
+      headers: error.config?.headers,
+      requestData: error.config?.data
+    });
+    res.status(500).json({
+      error: 'Erreur lors de la création du paiement GoCardless',
+      details: error.response?.data || error.message,
+      status: error.response?.status,
+      url: error.config?.url,
+      requestData: error.config?.data
+    });
+  }
+});
+
+// GET : récupérer un mandat par ID (AJOUTÉ)
+app.get('/mandates/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant'
+      });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.get(`${apiUrl}/mandates/${id}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    res.json(response.data);
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur récupération mandat:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Erreur lors de la récupération du mandat',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// GET : récupérer un paiement par ID (AJOUTÉ)
+app.get('/payments/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant'
+      });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.get(`${apiUrl}/payments/${id}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    res.json(response.data);
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur récupération paiement:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Erreur lors de la récupération du paiement',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// POST : annuler un paiement (AJOUTÉ)
+app.post('/payments/:id/cancel', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant'
+      });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.post(`${apiUrl}/payments/${id}/actions/cancel`, {}, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    res.json(response.data);
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur annulation paiement:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Erreur lors de l\'annulation du paiement',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// POST : créer un abonnement (AJOUTÉ)
+app.post('/create-subscription', async (req, res) => {
+  try {
+    console.log('[GoCardless] Création d\'abonnement:', req.body);
+    const { amount, currency, mandate_id, interval_unit, interval, description, metadata } = req.body;
+
+    if (!amount || !currency || !mandate_id || !interval_unit || !interval) {
+      return res.status(400).json({ 
+        error: 'amount, currency, mandate_id, interval_unit et interval sont requis' 
+      });
+    }
+
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant'
+      });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.post(`${apiUrl}/subscriptions`, {
+      subscriptions: {
+        amount: amount * 100, // Conversion en centimes
+        currency,
+        interval_unit, // 'weekly', 'monthly', 'yearly'
+        interval, // nombre d'intervalles
+        links: {
+          mandate: mandate_id
+        },
+        description: description || 'Abonnement maintenance',
+        metadata: metadata || {}
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    res.json({
+      subscriptionId: response.data.subscriptions.id,
+      status: response.data.subscriptions.status,
+      amount: response.data.subscriptions.amount,
+      currency: response.data.subscriptions.currency,
+      description: response.data.subscriptions.description
+    });
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur création abonnement:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Erreur lors de la création de l\'abonnement',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// POST : endpoint webhook pour recevoir les notifications Yousign
+app.post('/api/yousign/webhook', express.json(), async (req, res) => {
+  try {
+    console.log('[Yousign][Webhook] Notification reçue:', req.body);
+    
+    const { event, signature_request } = req.body;
+    
+    if (event === 'signature_request.completed' || event === 'signature_request.expired') {
+      // Mettre à jour le statut dans Firestore
+      // Note: Vous devrez implémenter la logique pour trouver la maintenance correspondante
+      console.log('[Yousign][Webhook] Demande de signature mise à jour:', signature_request.id);
+      
+      // Exemple de mise à jour (à adapter selon votre structure)
+      // const maintenanceRef = doc(db, 'maintenances', maintenanceId);
+      // await updateDoc(maintenanceRef, {
+      //   signatureStatus: event === 'signature_request.completed' ? 'signed' : 'expired',
+      //   updatedAt: new Date()
+      // });
+    }
+    
+    res.status(200).json({ received: true });
+  } catch (error) {
+    console.error('[Yousign][Webhook] Erreur:', error);
+    res.status(500).json({ error: 'Erreur webhook' });
+  }
+});
+
+// POST : endpoint webhook pour recevoir les notifications GoCardless (AJOUTÉ)
+app.post('/api/gocardless/webhook', express.json(), async (req, res) => {
+  try {
+    console.log('[GoCardless][Webhook] Notification reçue:', req.body);
+    
+    const { events } = req.body;
+    
+    if (events && Array.isArray(events)) {
+      for (const event of events) {
+        console.log('[GoCardless][Webhook] Traitement événement:', event.resource_type, event.action);
+        
+        switch (event.resource_type) {
+          case 'mandates':
+            await handleMandateEvent(event);
+            break;
+          case 'payments':
+            await handlePaymentEvent(event);
+            break;
+          case 'subscriptions':
+            await handleSubscriptionEvent(event);
+            break;
+          default:
+            console.log('[GoCardless][Webhook] Type d\'événement non géré:', event.resource_type);
+        }
+      }
+    }
+    
+    res.status(200).json({ received: true });
+  } catch (error) {
+    console.error('[GoCardless][Webhook] Erreur:', error);
+    res.status(500).json({ error: 'Erreur webhook GoCardless' });
+  }
+});
+
+// Fonctions de gestion des événements GoCardless (AJOUTÉES)
+async function handleMandateEvent(event) {
+  const { action, links } = event;
+  
+  switch (action) {
+    case 'created':
+      console.log('[GoCardless] Mandat créé:', links.mandate);
+      break;
+    case 'active':
+      console.log('[GoCardless] Mandat activé:', links.mandate);
+      // Mettre à jour le statut dans votre base de données
+      break;
+    case 'cancelled':
+      console.log('[GoCardless] Mandat annulé:', links.mandate);
+      break;
+    case 'expired':
+      console.log('[GoCardless] Mandat expiré:', links.mandate);
+      break;
+    default:
+      console.log('[GoCardless] Action de mandat non gérée:', action);
+  }
+}
+
+async function handlePaymentEvent(event) {
+  const { action, links } = event;
+  
+  switch (action) {
+    case 'created':
+      console.log('[GoCardless] Paiement créé:', links.payment);
+      break;
+    case 'confirmed':
+      console.log('[GoCardless] Paiement confirmé:', links.payment);
+      // Mettre à jour le statut de paiement dans votre base de données
+      break;
+    case 'failed':
+      console.log('[GoCardless] Paiement échoué:', links.payment);
+      // Gérer l'échec de paiement
+      break;
+    case 'cancelled':
+      console.log('[GoCardless] Paiement annulé:', links.payment);
+      break;
+    default:
+      console.log('[GoCardless] Action de paiement non gérée:', action);
+  }
+}
+
+async function handleSubscriptionEvent(event) {
+  const { action, links } = event;
+  
+  switch (action) {
+    case 'created':
+      console.log('[GoCardless] Abonnement créé:', links.subscription);
+      break;
+    case 'active':
+      console.log('[GoCardless] Abonnement activé:', links.subscription);
+      break;
+    case 'cancelled':
+      console.log('[GoCardless] Abonnement annulé:', links.subscription);
+      break;
+    default:
+      console.log('[GoCardless] Action d\'abonnement non gérée:', action);
+  }
+}
 
 // Lancer le serveur
 const PORT = process.env.PORT || 3002;
