@@ -9,7 +9,15 @@ const nodemailer = require('nodemailer');
 const app = express();
 app.use(express.json());
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:4173'],
+  origin: [
+    'http://localhost:5173', 
+    'http://localhost:3000', 
+    'http://localhost:4173',
+    'https://your-frontend-domain.com', // Remplacez par votre domaine frontend
+    'https://*.onrender.com', // Pour les apps Render
+    'https://*.vercel.app', // Pour les apps Vercel
+    'https://*.netlify.app' // Pour les apps Netlify
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin']
@@ -952,6 +960,36 @@ app.get('/mandates/:id', async (req, res) => {
     console.error('[GoCardless] Erreur récupération mandat:', error.response?.data || error.message);
     res.status(500).json({
       error: 'Erreur lors de la récupération du mandat',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// GET : récupérer tous les paiements (AJOUTÉ)
+app.get('/payments', async (req, res) => {
+  try {
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant'
+      });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.get(`${apiUrl}/payments`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    console.log('[GoCardless] Paiements récupérés:', response.data);
+    res.json(response.data);
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur récupération paiements:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Erreur lors de la récupération des paiements',
       details: error.response?.data || error.message
     });
   }
