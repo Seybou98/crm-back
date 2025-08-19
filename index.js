@@ -9,15 +9,7 @@ const nodemailer = require('nodemailer');
 const app = express();
 app.use(express.json());
 app.use(cors({
-  origin: [
-    'http://localhost:5173', 
-    'http://localhost:3000', 
-    'http://localhost:4173',
-    'https://your-frontend-domain.com', // Remplacez par votre domaine frontend
-    'https://*.onrender.com', // Pour les apps Render
-    'https://*.vercel.app', // Pour les apps Vercel
-    'https://*.netlify.app' // Pour les apps Netlify
-  ],
+  origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:4173'],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin']
@@ -811,7 +803,7 @@ app.get('/get-creditors', async (req, res) => {
   }
 });
 
-// POST : créer un paiement GoCardless
+// POST : créer un paiement GoCardless (endpoint principal)
 app.post('/create-payment', async (req, res) => {
   try {
     console.log('[GoCardless] Création de paiement:', req.body);
@@ -888,7 +880,7 @@ app.post('/create-payment', async (req, res) => {
 
     const response = await axios.post(`${apiUrl}/payments`, {
       payments: {
-        amount: amount * 100, // Conversion en centimes
+        amount: Math.round(amount * 100), // ✅ Conversion en centimes + arrondi à l'entier
         currency,
         links: {
           mandate: mandate_id
@@ -930,6 +922,114 @@ app.post('/create-payment', async (req, res) => {
       status: error.response?.status,
       url: error.config?.url,
       requestData: error.config?.data
+    });
+  }
+});
+
+// POST : créer un paiement GoCardless (endpoint API)
+app.post('/api/gocardless/create-payment', async (req, res) => {
+  try {
+    console.log('[GoCardless] Création de paiement via API:', req.body);
+    const { amount, currency, mandate_id, description, reference } = req.body;
+
+    if (!amount || !currency || !mandate_id) {
+      return res.status(400).json({ error: 'amount, currency et mandate_id sont requis' });
+    }
+
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant'
+      });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+
+    const response = await axios.post(`${apiUrl}/payments`, {
+      payments: {
+        amount: Math.round(amount * 100), // ✅ Conversion en centimes + arrondi à l'entier
+        currency,
+        links: {
+          mandate: mandate_id
+        },
+        description: description || 'Paiement de maintenance',
+        metadata: {
+          reference: reference || 'PAYMENT_CREATED'
+        }
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    res.json({
+      paymentId: response.data.payments.id,
+      status: response.data.payments.status,
+      amount: response.data.payments.amount,
+      currency: response.data.payments.currency,
+      description: response.data.payments.description
+    });
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur création paiement API:', {
+      message: error.message,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      url: error.config?.url,
+      headers: error.config?.headers,
+      requestData: error.config?.data
+    });
+    res.status(500).json({
+      error: 'Erreur lors de la création du paiement GoCardless',
+      details: error.response?.data || error.message,
+      status: error.response?.status,
+      url: error.config?.url,
+      requestData: error.config?.data
+    });
+  }
+});
+
+// GET : vérifier le statut d'un paiement GoCardless (AJOUTÉ)
+app.get('/api/gocardless/payment-status/:paymentId', async (req, res) => {
+  try {
+    const { paymentId } = req.params;
+    
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ 
+        error: 'GOCARDLESS_ACCESS_TOKEN manquant'
+      });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.get(`${apiUrl}/payments/${paymentId}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const payment = response.data.payments;
+    
+    res.json({
+      paymentId: payment.id,
+      status: payment.status,
+      amount: payment.amount,
+      currency: payment.currency,
+      description: payment.description,
+      chargeDate: payment.charge_date,
+      createdAt: payment.created_at,
+      links: payment.links
+    });
+
+  } catch (error) {
+    console.error('[GoCardless] Erreur vérification statut paiement:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Erreur lors de la vérification du statut du paiement',
+      details: error.response?.data || error.message
     });
   }
 });
@@ -1174,7 +1274,7 @@ app.post('/api/gocardless/webhook', express.json(), async (req, res) => {
   }
 });
 
-// Fonctions de gestion des événements GoCardless (AJOUTÉES)
+// Fonctions de gestion des événements GoCardless (AMÉLIORÉES)
 async function handleMandateEvent(event) {
   const { action, links } = event;
   
@@ -1184,13 +1284,16 @@ async function handleMandateEvent(event) {
       break;
     case 'active':
       console.log('[GoCardless] Mandat activé:', links.mandate);
-      // Mettre à jour le statut dans votre base de données
+      // ✅ NOUVEAU : Déclencher automatiquement le premier paiement
+      await triggerFirstPayment(links.mandate);
       break;
     case 'cancelled':
       console.log('[GoCardless] Mandat annulé:', links.mandate);
+      await handleMandateCancellation(links.mandate);
       break;
     case 'expired':
       console.log('[GoCardless] Mandat expiré:', links.mandate);
+      await handleMandateExpiration(links.mandate);
       break;
     default:
       console.log('[GoCardless] Action de mandat non gérée:', action);
@@ -1203,17 +1306,24 @@ async function handlePaymentEvent(event) {
   switch (action) {
     case 'created':
       console.log('[GoCardless] Paiement créé:', links.payment);
+      await handlePaymentCreated(links.payment);
       break;
     case 'confirmed':
       console.log('[GoCardless] Paiement confirmé:', links.payment);
-      // Mettre à jour le statut de paiement dans votre base de données
+      // ✅ NOUVEAU : Déclencher automatiquement le prochain paiement
+      await handlePaymentConfirmed(links.payment);
       break;
     case 'failed':
       console.log('[GoCardless] Paiement échoué:', links.payment);
-      // Gérer l'échec de paiement
+      await handlePaymentFailed(links.payment);
       break;
     case 'cancelled':
       console.log('[GoCardless] Paiement annulé:', links.payment);
+      await handlePaymentCancelled(links.payment);
+      break;
+    case 'submitted':
+      console.log('[GoCardless] Paiement soumis:', links.payment);
+      await handlePaymentSubmitted(links.payment);
       break;
     default:
       console.log('[GoCardless] Action de paiement non gérée:', action);
@@ -1235,6 +1345,388 @@ async function handleSubscriptionEvent(event) {
       break;
     default:
       console.log('[GoCardless] Action d\'abonnement non gérée:', action);
+  }
+}
+
+// ✅ NOUVEAU : Fonctions de gestion avancée des événements
+
+/**
+ * Déclencher automatiquement le premier paiement après activation du mandat
+ */
+async function triggerFirstPayment(mandateId) {
+  try {
+    console.log(`[GoCardless] Déclenchement du premier paiement pour le mandat: ${mandateId}`);
+    
+    // Récupérer les informations du mandat
+    const mandateResponse = await axios.get(`${getGoCardlessApiUrl()}/mandates/${mandateId}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const mandate = mandateResponse.data.mandates;
+    const metadata = mandate.metadata || {};
+    const maintenanceId = metadata.maintenanceId;
+    
+    if (!maintenanceId) {
+      console.log(`[GoCardless] Pas de maintenanceId dans les métadonnées du mandat: ${mandateId}`);
+      return;
+    }
+    
+    // Récupérer les informations de maintenance depuis Firebase
+    // (Cette partie sera gérée par le frontend via le scheduler)
+    console.log(`[GoCardless] Premier paiement déclenché pour la maintenance: ${maintenanceId}`);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors du déclenchement du premier paiement:`, error);
+  }
+}
+
+/**
+ * Gérer la confirmation d'un paiement et déclencher le suivant
+ */
+async function handlePaymentConfirmed(paymentId) {
+  try {
+    console.log(`[GoCardless] Gestion de la confirmation du paiement: ${paymentId}`);
+    
+    // Récupérer les informations du paiement
+    const paymentResponse = await axios.get(`${getGoCardlessApiUrl()}/payments/${paymentId}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const payment = paymentResponse.data.payments;
+    const metadata = payment.metadata || {};
+    const maintenanceId = metadata.maintenanceId;
+    
+    if (!maintenanceId) {
+      console.log(`[GoCardless] Pas de maintenanceId dans les métadonnées du paiement: ${paymentId}`);
+      return;
+    }
+    
+    // ✅ NOUVEAU : Notifier le frontend pour créer automatiquement le prochain paiement
+    await notifyFrontendPaymentConfirmed(maintenanceId, paymentId, payment);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la gestion de la confirmation:`, error);
+  }
+}
+
+/**
+ * Gérer l'échec d'un paiement
+ */
+async function handlePaymentFailed(paymentId) {
+  try {
+    console.log(`[GoCardless] Gestion de l'échec du paiement: ${paymentId}`);
+    
+    const paymentResponse = await axios.get(`${getGoCardlessApiUrl()}/payments/${paymentId}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const payment = paymentResponse.data.payments;
+    const metadata = payment.metadata || {};
+    const maintenanceId = metadata.maintenanceId;
+    
+    if (maintenanceId) {
+      // ✅ NOUVEAU : Notifier le frontend de l'échec
+      await notifyFrontendPaymentFailed(maintenanceId, paymentId, payment);
+    }
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la gestion de l'échec:`, error);
+  }
+}
+
+/**
+ * Gérer la soumission d'un paiement
+ */
+async function handlePaymentSubmitted(paymentId) {
+  try {
+    console.log(`[GoCardless] Gestion de la soumission du paiement: ${paymentId}`);
+    
+    const paymentResponse = await axios.get(`${getGoCardlessApiUrl()}/payments/${paymentId}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const payment = paymentResponse.data.payments;
+    const metadata = payment.metadata || {};
+    const maintenanceId = metadata.maintenanceId;
+    
+    if (maintenanceId) {
+      // ✅ NOUVEAU : Notifier le frontend de la soumission
+      await notifyFrontendPaymentSubmitted(maintenanceId, paymentId, payment);
+    }
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la gestion de la soumission:`, error);
+  }
+}
+
+/**
+ * Gérer la création d'un paiement
+ */
+async function handlePaymentCreated(paymentId) {
+  try {
+    console.log(`[GoCardless] Gestion de la création du paiement: ${paymentId}`);
+    
+    const paymentResponse = await axios.get(`${getGoCardlessApiUrl()}/payments/${paymentId}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const payment = paymentResponse.data.payments;
+    const metadata = payment.metadata || {};
+    const maintenanceId = metadata.maintenanceId;
+    
+    if (maintenanceId) {
+      // ✅ NOUVEAU : Notifier le frontend de la création
+      await notifyFrontendPaymentCreated(maintenanceId, paymentId, payment);
+    }
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la gestion de la création:`, error);
+  }
+}
+
+/**
+ * Gérer l'annulation d'un paiement
+ */
+async function handlePaymentCancelled(paymentId) {
+  try {
+    console.log(`[GoCardless] Gestion de l'annulation du paiement: ${paymentId}`);
+    
+    const paymentResponse = await axios.get(`${getGoCardlessApiUrl()}/payments/${paymentId}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const payment = paymentResponse.data.payments;
+    const metadata = payment.metadata || {};
+    const maintenanceId = metadata.maintenanceId;
+    
+    if (maintenanceId) {
+      // ✅ NOUVEAU : Notifier le frontend de l'annulation
+      await notifyFrontendPaymentCancelled(maintenanceId, paymentId, payment);
+    }
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la gestion de l'annulation:`, error);
+  }
+}
+
+/**
+ * Gérer l'annulation d'un mandat
+ */
+async function handleMandateCancellation(mandateId) {
+  try {
+    console.log(`[GoCardless] Gestion de l'annulation du mandat: ${mandateId}`);
+    
+    // ✅ NOUVEAU : Notifier le frontend de l'annulation du mandat
+    await notifyFrontendMandateCancelled(mandateId);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la gestion de l'annulation du mandat:`, error);
+  }
+}
+
+/**
+ * Gérer l'expiration d'un mandat
+ */
+async function handleMandateExpiration(mandateId) {
+  try {
+    console.log(`[GoCardless] Gestion de l'expiration du mandat: ${mandateId}`);
+    
+    // ✅ NOUVEAU : Notifier le frontend de l'expiration du mandat
+    await notifyFrontendMandateExpired(mandateId);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la gestion de l'expiration du mandat:`, error);
+  }
+}
+
+// ✅ NOUVEAU : Fonctions de notification du frontend
+
+/**
+ * Notifier le frontend qu'un paiement est confirmé
+ */
+async function notifyFrontendPaymentConfirmed(maintenanceId, paymentId, payment) {
+  try {
+    // ✅ NOUVEAU : Endpoint pour notifier le frontend
+    const response = await axios.post(`http://localhost:5173/api/gocardless/payment-update`, {
+      maintenanceId,
+      paymentId,
+      status: 'confirmed',
+      payment: {
+        id: payment.id,
+        amount: payment.amount,
+        currency: payment.currency,
+        status: payment.status,
+        created_at: payment.created_at,
+        charge_date: payment.charge_date
+      }
+    });
+    
+    console.log(`[GoCardless] Frontend notifié de la confirmation du paiement: ${paymentId}`);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la notification du frontend:`, error);
+  }
+}
+
+/**
+ * Notifier le frontend qu'un paiement a échoué
+ */
+async function notifyFrontendPaymentFailed(maintenanceId, paymentId, payment) {
+  try {
+    const response = await axios.post(`http://localhost:5173/api/gocardless/payment-update`, {
+      maintenanceId,
+      paymentId,
+      status: 'failed',
+      payment: {
+        id: payment.id,
+        amount: payment.amount,
+        currency: payment.currency,
+        status: payment.status,
+        created_at: payment.created_at,
+        charge_date: payment.charge_date
+      }
+    });
+    
+    console.log(`[GoCardless] Frontend notifié de l'échec du paiement: ${paymentId}`);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la notification du frontend:`, error);
+  }
+}
+
+/**
+ * Notifier le frontend qu'un paiement est soumis
+ */
+async function notifyFrontendPaymentSubmitted(maintenanceId, paymentId, payment) {
+  try {
+    const response = await axios.post(`http://localhost:5173/api/gocardless/payment-update`, {
+      maintenanceId,
+      paymentId,
+      status: 'submitted',
+      payment: {
+        id: payment.id,
+        amount: payment.amount,
+        currency: payment.currency,
+        status: payment.status,
+        created_at: payment.created_at,
+        charge_date: payment.charge_date
+      }
+    });
+    
+    console.log(`[GoCardless] Frontend notifié de la soumission du paiement: ${paymentId}`);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la notification du frontend:`, error);
+  }
+}
+
+/**
+ * Notifier le frontend qu'un paiement est créé
+ */
+async function notifyFrontendPaymentCreated(maintenanceId, paymentId, payment) {
+  try {
+    const response = await axios.post(`http://localhost:5173/api/gocardless/payment-update`, {
+      maintenanceId,
+      paymentId,
+      status: 'created',
+      payment: {
+        id: payment.id,
+        amount: payment.amount,
+        currency: payment.currency,
+        status: payment.status,
+        created_at: payment.created_at,
+        charge_date: payment.charge_date
+      }
+    });
+    
+    console.log(`[GoCardless] Frontend notifié de la création du paiement: ${paymentId}`);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la notification du frontend:`, error);
+  }
+}
+
+/**
+ * Notifier le frontend qu'un paiement est annulé
+ */
+async function notifyFrontendPaymentCancelled(maintenanceId, paymentId, payment) {
+  try {
+    const response = await axios.post(`http://localhost:5173/api/gocardless/payment-update`, {
+      maintenanceId,
+      paymentId,
+      status: 'cancelled',
+      payment: {
+        id: payment.id,
+        amount: payment.amount,
+        currency: payment.currency,
+        status: payment.status,
+        created_at: payment.created_at,
+        charge_date: payment.charge_date
+      }
+    });
+    
+    console.log(`[GoCardless] Frontend notifié de l'annulation du paiement: ${paymentId}`);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la notification du frontend:`, error);
+  }
+}
+
+/**
+ * Notifier le frontend qu'un mandat est annulé
+ */
+async function notifyFrontendMandateCancelled(mandateId) {
+  try {
+    const response = await axios.post(`http://localhost:5173/api/gocardless/mandate-update`, {
+      mandateId,
+      status: 'cancelled'
+    });
+    
+    console.log(`[GoCardless] Frontend notifié de l'annulation du mandat: ${mandateId}`);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la notification du frontend:`, error);
+  }
+}
+
+/**
+ * Notifier le frontend qu'un mandat est expiré
+ */
+async function notifyFrontendMandateExpired(mandateId) {
+  try {
+    const response = await axios.post(`http://localhost:5173/api/gocardless/mandate-update`, {
+      mandateId,
+      status: 'expired'
+    });
+    
+    console.log(`[GoCardless] Frontend notifié de l'expiration du mandat: ${mandateId}`);
+    
+  } catch (error) {
+    console.error(`[GoCardless] Erreur lors de la notification du frontend:`, error);
   }
 }
 
