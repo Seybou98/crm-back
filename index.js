@@ -12,6 +12,8 @@ app.use(express.json());
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:5173',
   process.env.ADMIN_URL || 'http://localhost:3000',
+  'https://teal-sunflower-0ade91.netlify.app', // Frontend Netlify (ancien)
+  'https://labelenergie1.netlify.app', // Frontend Netlify (nouveau)
   'http://localhost:5173', // Fallback pour développement
   'http://localhost:3000',  // Fallback pour développement
   'http://localhost:4173'   // Fallback pour développement
@@ -19,12 +21,18 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function (origin, callback) {
+    // Log pour debug CORS
+    console.log(`[CORS] Requête depuis origin: ${origin}`);
+    console.log(`[CORS] Origins autorisés:`, allowedOrigins);
+    
     // Permettre les requêtes sans origin (applications mobiles, etc.)
     if (!origin) {
+      console.log(`[CORS] Pas d'origin - autorisé`);
       return callback(null, true);
     }
     
     if (allowedOrigins.includes(origin)) {
+      console.log(`[CORS] Origin autorisé: ${origin}`);
       callback(null, true);
     } else {
       console.log(`[CORS] Origin bloqué: ${origin}`);
@@ -358,6 +366,35 @@ app.get('/api/yousign/signature-request/:id/document', async (req, res) => {
       details: error.response?.data || error.message
     });
   }
+});
+
+// Route de test CORS
+app.get('/cors-test', (req, res) => {
+  console.log(`[CORS-TEST] Requête reçue depuis: ${req.headers.origin}`);
+  res.json({
+    message: 'CORS test successful',
+    origin: req.headers.origin,
+    timestamp: new Date().toISOString(),
+    cors: {
+      allowedOrigins: allowedOrigins,
+      frontendUrl: process.env.FRONTEND_URL,
+      adminUrl: process.env.ADMIN_URL
+    }
+  });
+});
+
+// Route de test pour vérifier la connectivité
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development',
+    cors: {
+      allowedOrigins: allowedOrigins,
+      frontendUrl: process.env.FRONTEND_URL,
+      adminUrl: process.env.ADMIN_URL
+    }
+  });
 });
 
 // POST : créer un mandat GoCardless
