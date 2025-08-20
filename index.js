@@ -8,8 +8,29 @@ const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json());
+// Configuration CORS dynamique pour production
+const allowedOrigins = [
+  process.env.FRONTEND_URL || 'http://localhost:5173',
+  process.env.ADMIN_URL || 'http://localhost:3000',
+  'http://localhost:5173', // Fallback pour développement
+  'http://localhost:3000',  // Fallback pour développement
+  'http://localhost:4173'   // Fallback pour développement
+];
+
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:4173'],
+  origin: function (origin, callback) {
+    // Permettre les requêtes sans origin (applications mobiles, etc.)
+    if (!origin) {
+      return callback(null, true);
+    }
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.log(`[CORS] Origin bloqué: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin']
@@ -59,7 +80,8 @@ function getGoCardlessApiUrl() {
   return apiUrl;
 }
 
-const YOUSIGN_API_URL = 'https://api-sandbox.yousign.app/v3';
+// Configuration YouSign dynamique pour production
+const YOUSIGN_API_URL = process.env.YOUSIGN_API_URL || 'https://api-sandbox.yousign.app/v3';
 const YOUSIGN_API_TOKEN = process.env.YOUSIGN_API_TOKEN;
 const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || 'service_wl6kjuo';
 const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID || 'template_nfsa5wv';
@@ -1571,7 +1593,7 @@ async function handleMandateExpiration(mandateId) {
 async function notifyFrontendPaymentConfirmed(maintenanceId, paymentId, payment) {
   try {
     // ✅ NOUVEAU : Endpoint pour notifier le frontend
-    const response = await axios.post(`http://localhost:5173/api/gocardless/payment-update`, {
+    const response = await axios.post(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/api/gocardless/payment-update`, {
       maintenanceId,
       paymentId,
       status: 'confirmed',
@@ -1597,7 +1619,7 @@ async function notifyFrontendPaymentConfirmed(maintenanceId, paymentId, payment)
  */
 async function notifyFrontendPaymentFailed(maintenanceId, paymentId, payment) {
   try {
-    const response = await axios.post(`http://localhost:5173/api/gocardless/payment-update`, {
+    const response = await axios.post(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/api/gocardless/payment-update`, {
       maintenanceId,
       paymentId,
       status: 'failed',
@@ -1623,7 +1645,7 @@ async function notifyFrontendPaymentFailed(maintenanceId, paymentId, payment) {
  */
 async function notifyFrontendPaymentSubmitted(maintenanceId, paymentId, payment) {
   try {
-    const response = await axios.post(`http://localhost:5173/api/gocardless/payment-update`, {
+    const response = await axios.post(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/api/gocardless/payment-update`, {
       maintenanceId,
       paymentId,
       status: 'submitted',
@@ -1649,7 +1671,7 @@ async function notifyFrontendPaymentSubmitted(maintenanceId, paymentId, payment)
  */
 async function notifyFrontendPaymentCreated(maintenanceId, paymentId, payment) {
   try {
-    const response = await axios.post(`http://localhost:5173/api/gocardless/payment-update`, {
+    const response = await axios.post(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/api/gocardless/payment-update`, {
       maintenanceId,
       paymentId,
       status: 'created',
@@ -1675,7 +1697,7 @@ async function notifyFrontendPaymentCreated(maintenanceId, paymentId, payment) {
  */
 async function notifyFrontendPaymentCancelled(maintenanceId, paymentId, payment) {
   try {
-    const response = await axios.post(`http://localhost:5173/api/gocardless/payment-update`, {
+    const response = await axios.post(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/api/gocardless/payment-update`, {
       maintenanceId,
       paymentId,
       status: 'cancelled',
@@ -1701,7 +1723,7 @@ async function notifyFrontendPaymentCancelled(maintenanceId, paymentId, payment)
  */
 async function notifyFrontendMandateCancelled(mandateId) {
   try {
-    const response = await axios.post(`http://localhost:5173/api/gocardless/mandate-update`, {
+    const response = await axios.post(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/api/gocardless/mandate-update`, {
       mandateId,
       status: 'cancelled'
     });
@@ -1718,7 +1740,7 @@ async function notifyFrontendMandateCancelled(mandateId) {
  */
 async function notifyFrontendMandateExpired(mandateId) {
   try {
-    const response = await axios.post(`http://localhost:5173/api/gocardless/mandate-update`, {
+    const response = await axios.post(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/api/gocardless/mandate-update`, {
       mandateId,
       status: 'expired'
     });
