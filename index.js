@@ -1,10 +1,28 @@
-require('dotenv').config();
+// Chargement forcé du fichier .env
+const path = require('path');
+const result = require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+if (result.error) {
+  console.error('❌ Erreur lors du chargement du fichier .env:', result.error);
+} else {
+  console.log('✅ Fichier .env chargé avec succès');
+  console.log('🔑 Variables d\'environnement chargées:', {
+    YOUSIGN_API_KEY: process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE',
+    YOUSIGN_API_URL: process.env.YOUSIGN_API_URL,
+    PORT: process.env.PORT,
+    NODE_ENV: process.env.NODE_ENV
+  });
+}
 const express = require('express');
 const fs = require('fs');
 const FormData = require('form-data');
 const axios = require('axios');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
+
+// Imports Firestore pour la synchronisation YouSign
+const { initializeApp } = require('firebase/app');
+const { getFirestore, doc, updateDoc, collection, query, where, getDocs } = require('firebase/firestore');
 
 const app = express();
 app.use(express.json());
@@ -90,10 +108,24 @@ function getGoCardlessApiUrl() {
 
 // Configuration YouSign dynamique pour production
 const YOUSIGN_API_URL = process.env.YOUSIGN_API_URL || 'https://api-sandbox.yousign.app/v3';
-const YOUSIGN_API_TOKEN = process.env.YOUSIGN_API_TOKEN;
+const YOUSIGN_API_TOKEN = process.env.YOUSIGN_API_KEY;
 const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || 'service_wl6kjuo';
 const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID || 'template_nfsa5wv';
 const EMAILJS_USER_ID = process.env.EMAILJS_USER_ID || '9DbPDdjUGFwv3WVZ0';
+
+// Configuration Firebase pour la synchronisation YouSign
+const firebaseConfig = {
+  apiKey: process.env.VITE_FIREBASE_API_KEY,
+  authDomain: process.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: process.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.VITE_FIREBASE_APP_ID
+};
+
+// Initialiser Firebase
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp);
 
 // Utilitaire axios Yousign
 const yousignApi = axios.create({
@@ -1788,6 +1820,216 @@ async function notifyFrontendMandateExpired(mandateId) {
     console.error(`[GoCardless] Erreur lors de la notification du frontend:`, error);
   }
 }
+
+// GET : récupérer le statut d'une signature YouSign
+app.get('/api/yousign/status/:requestId', async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    console.log('[Yousign] Vérification du statut de la signature:', requestId);
+    console.log('[Yousign] Variables d\'environnement:', {
+      YOUSIGN_API_KEY: process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE',
+      YOUSIGN_API_URL: process.env.YOUSIGN_API_URL,
+      NODE_ENV: process.env.NODE_ENV
+    });
+
+    if (!process.env.YOUSIGN_API_KEY) {
+      console.log('[Yousign] ERREUR: YOUSIGN_API_KEY manquante');
+      return res.status(500).json({ 
+        error: 'YOUSIGN_API_KEY manquant'
+      });
+    }
+
+    // Appel à l'API YouSign officielle
+    console.log('[Yousign] Appel API YouSign avec clé:', process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE');
+    const apiUrl = `${process.env.YOUSIGN_API_URL}/v3/signature-requests/${requestId}`;
+    console.log('[Yousign] URL appelée:', apiUrl);
+    
+    const response = await axios.get(apiUrl, {
+      headers: {
+        'Authorization': `Bearer ${process.env.YOUSIGN_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const signatureRequest = response.data;
+    console.log('[Yousign] Statut récupéré:', signatureRequest.status);
+
+    // Formater la réponse pour le frontend
+    const formattedResponse = {
+      data: {
+        id: signatureRequest.id,
+        status: signatureRequest.status,
+        signed_at: signatureRequest.signed_at,
+        declined_at: signatureRequest.declined_at,
+        expired_at: signatureRequest.expired_at,
+        created_at: signatureRequest.created_at,
+        updated_at: signatureRequest.updated_at
+      },
+      signers: signatureRequest.signers?.map(signer => ({
+        id: signer.id,
+        email: signer.email,
+        status: signer.status,
+        signed_at: signer.signed_at,
+        declined_at: signer.declined_at
+      })) || []
+    };
+
+    res.json(formattedResponse);
+
+  } catch (error) {
+    console.error('[Yousign] Erreur lors de la récupération du statut:', error.response?.data || error.message);
+    
+    if (error.response?.status === 404) {
+      return res.status(404).json({ error: 'Demande de signature non trouvée' });
+    }
+    
+    res.status(500).json({
+      error: 'Erreur lors de la récupération du statut de signature',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// GET : récupérer toutes les maintenances en attente de signature
+app.get('/api/maintenance/pending-signatures', async (req, res) => {
+  try {
+    console.log('[Maintenance] Récupération des maintenances en attente de signature');
+
+    // Récupérer depuis Firestore (vous devrez adapter selon votre structure)
+    const maintenancesRef = collection(db, 'maintenances');
+    const q = query(
+      maintenancesRef,
+      where('signatureStatus', '==', 'pending'),
+      where('yousignRequestId', '!=', null)
+    );
+
+    const snapshot = await getDocs(q);
+    const maintenances = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
+    console.log(`[Maintenance] ${maintenances.length} maintenances en attente trouvées`);
+
+    res.json({ maintenances });
+
+  } catch (error) {
+    console.error('[Maintenance] Erreur lors de la récupération des maintenances:', error);
+    res.status(500).json({
+      error: 'Erreur lors de la récupération des maintenances',
+      details: error.message
+    });
+  }
+});
+
+// PATCH : mettre à jour le statut de signature d'une maintenance
+app.patch('/api/maintenance/:id/signature', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { signatureStatus, signatureDate } = req.body;
+
+    console.log(`[Maintenance] Mise à jour de la signature pour ${id}:`, { signatureStatus, signatureDate });
+
+    if (!signatureStatus) {
+      return res.status(400).json({ error: 'signatureStatus est requis' });
+    }
+
+    // Mettre à jour dans Firestore
+    const maintenanceRef = doc(db, 'maintenances', id);
+    const updateData = {
+      signatureStatus,
+      updatedAt: new Date()
+    };
+
+    if (signatureDate) {
+      updateData.signatureDate = signatureDate;
+    }
+
+    await updateDoc(maintenanceRef, updateData);
+
+    console.log(`[Maintenance] Maintenance ${id} mise à jour avec succès`);
+
+    res.json({ 
+      success: true, 
+      message: 'Statut de signature mis à jour',
+      data: updateData
+    });
+
+  } catch (error) {
+    console.error('[Maintenance] Erreur lors de la mise à jour de la signature:', error);
+    res.status(500).json({
+      error: 'Erreur lors de la mise à jour de la signature',
+      details: error.message
+    });
+  }
+});
+
+// GET : télécharger un contrat signé depuis YouSign
+app.get('/api/yousign/download/:requestId', async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    console.log('[Yousign] Téléchargement du contrat signé:', requestId);
+    console.log('[Yousign] Variables d\'environnement (download):', {
+      YOUSIGN_API_KEY: process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE',
+      YOUSIGN_API_URL: process.env.YOUSIGN_API_URL,
+      NODE_ENV: process.env.NODE_ENV
+    });
+
+    if (!process.env.YOUSIGN_API_KEY) {
+      console.log('[Yousign] ERREUR: YOUSIGN_API_KEY manquante (download)');
+      return res.status(500).json({ 
+        error: 'YOUSIGN_API_KEY manquant'
+      });
+    }
+
+    // Récupérer le document signé depuis YouSign
+    console.log('[Yousign] Appel API YouSign documents avec clé:', process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE');
+    const documentsUrl = `${process.env.YOUSIGN_API_URL}/v3/signature-requests/${requestId}/documents`;
+    console.log('[Yousign] URL documents appelée:', documentsUrl);
+    
+    const response = await axios.get(documentsUrl, {
+      headers: {
+        'Authorization': `Bearer ${process.env.YOUSIGN_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.data || !response.data.length) {
+      return res.status(404).json({ error: 'Aucun document trouvé pour cette signature' });
+    }
+
+    // Récupérer le premier document (normalement il n'y en a qu'un)
+    const document = response.data[0];
+    
+    // Télécharger le fichier signé
+    const downloadUrl = `${process.env.YOUSIGN_API_URL}/v3/documents/${document.id}/download`;
+    const fileResponse = await axios.get(downloadUrl, {
+      headers: {
+        'Authorization': `Bearer ${process.env.YOUSIGN_API_KEY}`
+      },
+      responseType: 'stream'
+    });
+
+    // Configurer les headers pour le téléchargement
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Contrat_Signe_${requestId}.pdf"`);
+    
+    // Streamer le fichier vers la réponse
+    fileResponse.data.pipe(res);
+
+  } catch (error) {
+    console.error('[Yousign] Erreur lors du téléchargement:', error.response?.data || error.message);
+    
+    if (error.response?.status === 404) {
+      return res.status(404).json({ error: 'Document signé non trouvé' });
+    }
+    
+    res.status(500).json({
+      error: 'Erreur lors du téléchargement du contrat signé',
+      details: error.response?.data || error.message
+    });
+  }
+});
 
 // Lancer le serveur
 const PORT = process.env.PORT || 3002;
