@@ -127,6 +127,148 @@ const firebaseConfig = {
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp);
 
+// Configuration des webhooks GoCardless
+const GOCARDLESS_WEBHOOK_SECRET = process.env.GOCARDLESS_WEBHOOK_SECRET;
+
+// Fonction pour valider la signature du webhook GoCardless
+function validateGoCardlessWebhook(payload, signature) {
+  if (!GOCARDLESS_WEBHOOK_SECRET) {
+    console.warn('[Webhook] GOCARDLESS_WEBHOOK_SECRET non configuré, validation désactivée');
+    return true;
+  }
+
+  try {
+    const crypto = require('crypto');
+    const expectedSignature = crypto
+      .createHmac('sha256', GOCARDLESS_WEBHOOK_SECRET)
+      .update(payload)
+      .digest('hex');
+    
+    const isValid = crypto.timingSafeEqual(
+      Buffer.from(signature, 'hex'),
+      Buffer.from(expectedSignature, 'hex')
+    );
+    
+    console.log('[Webhook] Validation signature:', { isValid, expected: expectedSignature, received: signature });
+    return isValid;
+  } catch (error) {
+    console.error('[Webhook] Erreur validation signature:', error);
+    return false;
+  }
+}
+
+// Fonction pour trouver une maintenance par ID de paiement GoCardless
+async function findMaintenanceByPaymentId(paymentId) {
+  try {
+    console.log('[Webhook] Recherche maintenance pour paiement:', paymentId);
+    
+    const maintenancesRef = collection(db, 'maintenances');
+    const q = query(maintenancesRef, where('goCardlessPaymentId', '==', paymentId));
+    const snapshot = await getDocs(q);
+    
+    if (!snapshot.empty) {
+      const maintenance = snapshot.docs[0];
+      console.log('[Webhook] Maintenance trouvée:', maintenance.id, maintenance.data().clientName);
+      return { id: maintenance.id, ...maintenance.data() };
+    }
+    
+    console.log('[Webhook] Aucune maintenance trouvée pour le paiement:', paymentId);
+    return null;
+  } catch (error) {
+    console.error('[Webhook] Erreur recherche maintenance:', error);
+    return null;
+  }
+}
+
+// Fonction pour mettre à jour le statut de paiement d'une maintenance
+async function updateMaintenancePaymentStatus(maintenanceId, newStatus, additionalData = {}) {
+  try {
+    console.log('[Webhook] Mise à jour statut paiement:', { maintenanceId, newStatus, additionalData });
+    
+    const maintenanceRef = doc(db, 'maintenances', maintenanceId);
+    const updateData = {
+      paymentStatus: newStatus,
+      updatedAt: new Date(),
+      lastPaymentUpdate: new Date(),
+      ...additionalData
+    };
+    
+    await updateDoc(maintenanceRef, updateData);
+    
+    console.log('[Webhook] Statut paiement mis à jour avec succès:', { maintenanceId, newStatus });
+    return true;
+  } catch (error) {
+    console.error('[Webhook] Erreur mise à jour statut paiement:', error);
+    return false;
+  }
+}
+
+// Fonction pour traiter les événements de paiement GoCardless
+async function processGoCardlessPaymentEvent(event) {
+  try {
+    console.log('[Webhook] Traitement événement paiement:', {
+      id: event.id,
+      resourceType: event.resource_type,
+      action: event.action,
+      paymentId: event.links?.payment
+    });
+    
+    if (event.resource_type !== 'payment' || !event.links?.payment) {
+      console.log('[Webhook] Événement ignoré (pas un paiement):', event.resource_type);
+      return false;
+    }
+    
+    const paymentId = event.links.payment;
+    const action = event.action;
+    
+    // Mapping des actions GoCardless vers nos statuts
+    const statusMapping = {
+      'confirmed': 'confirmed',
+      'paid_out': 'paid_out',
+      'failed': 'failed',
+      'cancelled': 'cancelled',
+      'charged_back': 'charged_back',
+      'submitted': 'submitted',
+      'pending_submission': 'pending_submission'
+    };
+    
+    const newStatus = statusMapping[action];
+    if (!newStatus) {
+      console.log('[Webhook] Action non mappée:', action);
+      return false;
+    }
+    
+    // Trouver la maintenance correspondante
+    const maintenance = await findMaintenanceByPaymentId(paymentId);
+    if (!maintenance) {
+      console.log('[Webhook] Maintenance non trouvée pour le paiement:', paymentId);
+      return false;
+    }
+    
+    // Mettre à jour le statut
+    const success = await updateMaintenancePaymentStatus(maintenance.id, newStatus, {
+      goCardlessEventId: event.id,
+      goCardlessEventAction: action,
+      goCardlessEventCreatedAt: event.created_at
+    });
+    
+    if (success) {
+      console.log('[Webhook] Événement traité avec succès:', {
+        maintenanceId: maintenance.id,
+        clientName: maintenance.clientName,
+        oldStatus: maintenance.paymentStatus,
+        newStatus: newStatus,
+        action: action
+      });
+    }
+    
+    return success;
+  } catch (error) {
+    console.error('[Webhook] Erreur traitement événement paiement:', error);
+    return false;
+  }
+}
+
 // Utilitaire axios Yousign
 const yousignApi = axios.create({
   baseURL: YOUSIGN_API_URL,
@@ -2035,4 +2177,193 @@ app.get('/api/yousign/download/:requestId', async (req, res) => {
 const PORT = process.env.PORT || 3002;
 app.listen(PORT, () => {
   console.log(`Serveur Yousign backend démarré sur le port ${PORT}`);
+});
+
+// POST : Webhook GoCardless pour les mises à jour de statut de paiement
+app.post('/webhooks/gocardless', async (req, res) => {
+  try {
+    console.log('[Webhook] Réception webhook GoCardless');
+    
+    // Validation de la signature du webhook
+    const signature = req.headers['webhook-signature'];
+    const payload = JSON.stringify(req.body);
+    
+    if (!validateGoCardlessWebhook(payload, signature)) {
+      console.error('[Webhook] Signature invalide, webhook rejeté');
+      return res.status(401).json({ error: 'Signature invalide' });
+    }
+    
+    const { events } = req.body;
+    console.log('[Webhook] Événements reçus:', events?.length || 0);
+    
+    if (!events || !Array.isArray(events)) {
+      console.log('[Webhook] Aucun événement reçu');
+      return res.status(200).json({ message: 'Aucun événement à traiter' });
+    }
+    
+    let processedCount = 0;
+    let errorCount = 0;
+    
+    // Traiter chaque événement
+    for (const event of events) {
+      try {
+        const success = await processGoCardlessPaymentEvent(event);
+        if (success) {
+          processedCount++;
+        } else {
+          errorCount++;
+        }
+      } catch (error) {
+        console.error('[Webhook] Erreur traitement événement:', event.id, error);
+        errorCount++;
+      }
+    }
+    
+    console.log('[Webhook] Traitement terminé:', { processed: processedCount, errors: errorCount });
+    
+    res.status(200).json({ 
+      message: 'Webhook traité avec succès',
+      processed: processedCount,
+      errors: errorCount
+    });
+    
+  } catch (error) {
+    console.error('[Webhook] Erreur générale webhook:', error);
+    res.status(500).json({ 
+      error: 'Erreur interne du serveur',
+      details: error.message 
+    });
+  }
+});
+
+// GET : Test du webhook GoCardless (pour développement)
+app.get('/webhooks/gocardless/test', async (req, res) => {
+  try {
+    console.log('[Webhook] Test du webhook GoCardless');
+    
+    // Simuler un événement de test
+    const testEvent = {
+      id: 'test_event_' + Date.now(),
+      resource_type: 'payment',
+      action: 'confirmed',
+      links: {
+        payment: 'test_payment_id'
+      },
+      created_at: new Date().toISOString()
+    };
+    
+    const success = await processGoCardlessPaymentEvent(testEvent);
+    
+    res.json({
+      message: 'Test webhook terminé',
+      success: success,
+      testEvent: testEvent,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('[Webhook] Erreur test webhook:', error);
+    res.status(500).json({
+      error: 'Erreur lors du test du webhook',
+      details: error.message
+    });
+  }
+});
+
+// POST : Configuration des webhooks GoCardless
+app.post('/api/gocardless/webhooks/setup', async (req, res) => {
+  try {
+    console.log('[Webhook] Configuration des webhooks GoCardless');
+    
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(400).json({ error: 'GOCARDLESS_ACCESS_TOKEN manquant' });
+    }
+    
+    const webhookUrl = `${req.protocol}://${req.get('host')}/webhooks/gocardless`;
+    console.log('[Webhook] URL webhook:', webhookUrl);
+    
+    // Créer le webhook via l'API GoCardless
+    const response = await axios.post(
+      `${getGoCardlessApiUrl()}/webhooks`,
+      {
+        url: webhookUrl,
+        events: [
+          'payment.created',
+          'payment.confirmed',
+          'payment.paid_out',
+          'payment.failed',
+          'payment.cancelled',
+          'payment.charged_back',
+          'payment.submitted'
+        ]
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+          'GoCardless-Version': '2015-07-06',
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    console.log('[Webhook] Webhook créé avec succès:', response.data);
+    
+    res.json({
+      success: true,
+      message: 'Webhook GoCardless configuré avec succès',
+      webhook: response.data,
+      webhookUrl: webhookUrl
+    });
+    
+  } catch (error) {
+    console.error('[Webhook] Erreur configuration webhook:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Erreur lors de la configuration du webhook',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// GET : Statut des webhooks GoCardless
+app.get('/api/gocardless/webhooks/status', async (req, res) => {
+  try {
+    console.log('[Webhook] Vérification statut des webhooks GoCardless');
+    
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(400).json({ error: 'GOCARDLESS_ACCESS_TOKEN manquant' });
+    }
+    
+    const response = await axios.get(
+      `${getGoCardlessApiUrl()}/webhooks`,
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+          'GoCardless-Version': '2015-07-06'
+        }
+      }
+    );
+    
+    const webhooks = response.data.webhooks || [];
+    const activeWebhooks = webhooks.filter(w => w.status === 'active');
+    
+    res.json({
+      success: true,
+      total: webhooks.length,
+      active: activeWebhooks.length,
+      webhooks: webhooks.map(w => ({
+        id: w.id,
+        url: w.url,
+        status: w.status,
+        events: w.events,
+        created_at: w.created_at
+      }))
+    });
+    
+  } catch (error) {
+    console.error('[Webhook] Erreur vérification statut webhooks:', error.response?.data || error.message);
+    res.status(500).json({
+      error: 'Erreur lors de la vérification du statut des webhooks',
+      details: error.response?.data || error.message
+    });
+  }
 });
