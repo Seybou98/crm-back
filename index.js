@@ -20,6 +20,9 @@ const axios = require('axios');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
 
+// Importer les routes de test
+const testRoutes = require('./test-endpoints');
+
 // Imports Firestore pour la synchronisation YouSign
 const { initializeApp } = require('firebase/app');
 const { getFirestore, doc, updateDoc, collection, query, where, getDocs } = require('firebase/firestore');
@@ -61,6 +64,9 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin']
 }));
+
+// Routes de test pour YouSign et GoCardless
+app.use('/', testRoutes);
 
 // Fonction de validation IBAN (AJOUTÉE) - Version améliorée
 function validateIBAN(iban) {
@@ -106,8 +112,68 @@ function getGoCardlessApiUrl() {
   return apiUrl;
 }
 
+// Fonction pour convertir un nom de pays en code ISO (AJOUTÉE)
+function getCountryCode(countryName) {
+  if (!countryName) return 'FR';
+  
+  const countryMap = {
+    'france': 'FR',
+    'french': 'FR',
+    'fr': 'FR',
+    'belgium': 'BE',
+    'belgique': 'BE',
+    'be': 'BE',
+    'switzerland': 'CH',
+    'suisse': 'CH',
+    'ch': 'CH',
+    'germany': 'DE',
+    'allemagne': 'DE',
+    'de': 'DE',
+    'spain': 'ES',
+    'espagne': 'ES',
+    'es': 'ES',
+    'italy': 'IT',
+    'italie': 'IT',
+    'it': 'IT',
+    'netherlands': 'NL',
+    'pays-bas': 'NL',
+    'nl': 'NL',
+    'luxembourg': 'LU',
+    'lu': 'LU',
+    'portugal': 'PT',
+    'pt': 'PT',
+    'austria': 'AT',
+    'autriche': 'AT',
+    'at': 'AT'
+  };
+  
+  const normalized = countryName.toLowerCase().trim();
+  const code = countryMap[normalized];
+  
+  if (code) {
+    console.log(`[GoCardless] Conversion pays: "${countryName}" -> "${code}"`);
+    return code;
+  }
+  
+  // Si c'est déjà un code à 2 lettres en majuscules, le retourner
+  if (/^[A-Z]{2}$/.test(countryName.trim().toUpperCase())) {
+    console.log(`[GoCardless] Code pays déjà valide: "${countryName}"`);
+    return countryName.trim().toUpperCase();
+  }
+  
+  // Par défaut, retourner FR
+  console.log(`[GoCardless] Pays non reconnu "${countryName}", utilisation de "FR" par défaut`);
+  return 'FR';
+}
+
 // Configuration YouSign dynamique pour production
-const YOUSIGN_API_URL = process.env.YOUSIGN_API_URL || 'https://api-sandbox.yousign.app/v3';
+// Normaliser l'URL pour s'assurer qu'elle se termine par /v3
+let YOUSIGN_API_URL = process.env.YOUSIGN_API_URL || 'https://api-sandbox.yousign.app/v3';
+if (!YOUSIGN_API_URL.endsWith('/v3')) {
+  // Si l'URL ne se termine pas par /v3, l'ajouter
+  YOUSIGN_API_URL = YOUSIGN_API_URL.replace(/\/+$/, '') + '/v3';
+}
+console.log('[YouSign] URL API normalisée:', YOUSIGN_API_URL);
 const YOUSIGN_API_TOKEN = process.env.YOUSIGN_API_KEY;
 const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || 'service_wl6kjuo';
 const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID || 'template_nfsa5wv';
@@ -279,11 +345,22 @@ const yousignApi = axios.create({
 
 // 1. Créer la demande de signature
 async function createSignatureRequest(name = 'My Signature Request') {
-  const res = await yousignApi.post('/signature_requests', {
-    name,
-    delivery_mode: 'email'
-  });
-  return res.data.id;
+  try {
+    console.log('[YouSign] Appel API pour créer la demande de signature');
+    console.log('[YouSign] URL complète:', `${YOUSIGN_API_URL}/signature_requests`);
+    console.log('[YouSign] Données:', { name, delivery_mode: 'email' });
+    const res = await yousignApi.post('/signature_requests', {
+      name,
+      delivery_mode: 'email'
+    });
+    console.log('[YouSign] Réponse reçue:', res.status, res.statusText);
+    return res.data.id;
+  } catch (error) {
+    console.error('[YouSign] Erreur lors de la création de la demande:', error.response?.data || error.message);
+    console.error('[YouSign] URL appelée:', error.config?.url);
+    console.error('[YouSign] Méthode:', error.config?.method);
+    throw error;
+  }
 }
 
 // 2. Uploader le document
@@ -645,16 +722,20 @@ app.post('/create-mandate', async (req, res) => {
       });
     }
 
+    // Convertir le nom du pays en code ISO
+    const countryCode = getCountryCode(metadata?.country);
+    console.log('[GoCardless] Code pays utilisé:', countryCode, '(depuis:', metadata?.country, ')');
+
     // 1. Créer le client
     const customerResponse = await axios.post(`${apiUrl}/customers`, {
       customers: {
-        email: `${account_holder_name.toLowerCase().replace(' ', '.')}@example.com`,
+        email: `${account_holder_name.toLowerCase().replace(/\s+/g, '.')}@example.com`,
         given_name: account_holder_name.split(' ')[0] || account_holder_name,
         family_name: account_holder_name.split(' ').slice(1).join(' ') || account_holder_name,
         address_line1: metadata?.address || 'Adresse non spécifiée',
         city: metadata?.city || 'Ville non spécifiée',
         postal_code: metadata?.postalCode || '00000',
-        country_code: metadata?.country || 'FR'
+        country_code: countryCode
       }
     }, {
       headers: {
@@ -665,12 +746,23 @@ app.post('/create-mandate', async (req, res) => {
     });
 
     // 2. Créer le compte bancaire
+    const cleanIban = iban.replace(/\s/g, '').toUpperCase();
+    const cleanAccountHolderName = account_holder_name.trim();
+    const customerId = customerResponse.data.customers.id;
+    
+    console.log('[GoCardless] Création du compte bancaire:', {
+      account_holder_name: cleanAccountHolderName,
+      iban: cleanIban,
+      ibanLength: cleanIban.length,
+      customerId: customerId
+    });
+    
     const bankAccountResponse = await axios.post(`${apiUrl}/customer_bank_accounts`, {
       customer_bank_accounts: {
-        account_holder_name,
-        iban,
+        account_holder_name: cleanAccountHolderName,
+        iban: cleanIban,
         links: {
-          customer: customerResponse.data.customers.id
+          customer: customerId
         }
       }
     }, {
@@ -682,6 +774,16 @@ app.post('/create-mandate', async (req, res) => {
     });
 
     // 3. Créer le mandat
+    // GoCardless n'accepte que 3 propriétés maximum dans les métadonnées
+    // On garde les plus importantes : contractNumber, maintenanceId, clientId
+    const limitedMetadata = {
+      contractNumber: metadata?.contractNumber || '',
+      maintenanceId: metadata?.maintenanceId || '',
+      clientId: metadata?.clientId || ''
+    };
+    
+    console.log('[GoCardless] Métadonnées limitées à 3 propriétés:', limitedMetadata);
+    
     const mandateResponse = await axios.post(`${apiUrl}/mandates`, {
       mandates: {
         scheme: 'sepa_core',
@@ -689,7 +791,7 @@ app.post('/create-mandate', async (req, res) => {
           customer_bank_account: bankAccountResponse.data.customer_bank_accounts.id,
           creditor: process.env.GOCARDLESS_CREDITOR_ID
         },
-        metadata: metadata || {}
+        metadata: limitedMetadata
       }
     }, {
       headers: {
@@ -728,16 +830,24 @@ app.post('/create-mandate', async (req, res) => {
       status: error.response?.status,
       statusText: error.response?.statusText,
       data: error.response?.data,
+      errors: error.response?.data?.error?.errors || error.response?.data?.errors || [],
       url: error.config?.url,
       headers: error.config?.headers,
       requestData: error.config?.data
     });
-    res.status(500).json({
+    
+    // Afficher les erreurs de validation en détail
+    if (error.response?.data?.error?.errors) {
+      console.error('[GoCardless] Erreurs de validation détaillées:', JSON.stringify(error.response.data.error.errors, null, 2));
+    }
+    
+    res.status(error.response?.status || 500).json({
       error: 'Erreur lors de la création du mandat GoCardless',
       details: error.response?.data || error.message,
       status: error.response?.status,
       url: error.config?.url,
-      requestData: error.config?.data
+      requestData: error.config?.data,
+      validationErrors: error.response?.data?.error?.errors || error.response?.data?.errors || []
     });
   }
 });
@@ -783,16 +893,20 @@ app.post('/create-mandate-sandbox', async (req, res) => {
     const apiUrl = 'https://api-sandbox.gocardless.com';
     console.log('[GoCardless] Utilisation forcée de l\'API sandbox:', apiUrl);
 
+    // Convertir le nom du pays en code ISO
+    const countryCode = getCountryCode(metadata?.country);
+    console.log('[GoCardless] Code pays utilisé:', countryCode, '(depuis:', metadata?.country, ')');
+
     // 1. Créer le client
     const customerResponse = await axios.post(`${apiUrl}/customers`, {
       customers: {
-        email: `${account_holder_name.toLowerCase().replace(' ', '.')}@example.com`,
+        email: `${account_holder_name.toLowerCase().replace(/\s+/g, '.')}@example.com`,
         given_name: account_holder_name.split(' ')[0] || account_holder_name,
         family_name: account_holder_name.split(' ').slice(1).join(' ') || account_holder_name,
         address_line1: metadata?.address || 'Adresse non spécifiée',
         city: metadata?.city || 'Ville non spécifiée',
         postal_code: metadata?.postalCode || '00000',
-        country_code: metadata?.country || 'FR'
+        country_code: countryCode
       }
     }, {
       headers: {
@@ -803,12 +917,23 @@ app.post('/create-mandate-sandbox', async (req, res) => {
     });
 
     // 2. Créer le compte bancaire
+    const cleanIban = iban.replace(/\s/g, '').toUpperCase();
+    const cleanAccountHolderName = account_holder_name.trim();
+    const customerId = customerResponse.data.customers.id;
+    
+    console.log('[GoCardless] Création du compte bancaire (sandbox):', {
+      account_holder_name: cleanAccountHolderName,
+      iban: cleanIban,
+      ibanLength: cleanIban.length,
+      customerId: customerId
+    });
+    
     const bankAccountResponse = await axios.post(`${apiUrl}/customer_bank_accounts`, {
       customer_bank_accounts: {
-        account_holder_name,
-        iban,
+        account_holder_name: cleanAccountHolderName,
+        iban: cleanIban,
         links: {
-          customer: customerResponse.data.customers.id
+          customer: customerId
         }
       }
     }, {
@@ -820,6 +945,16 @@ app.post('/create-mandate-sandbox', async (req, res) => {
     });
 
     // 3. Créer le mandat
+    // GoCardless n'accepte que 3 propriétés maximum dans les métadonnées
+    // On garde les plus importantes : contractNumber, maintenanceId, clientId
+    const limitedMetadata = {
+      contractNumber: metadata?.contractNumber || '',
+      maintenanceId: metadata?.maintenanceId || '',
+      clientId: metadata?.clientId || ''
+    };
+    
+    console.log('[GoCardless] Métadonnées limitées à 3 propriétés (sandbox):', limitedMetadata);
+    
     const mandateResponse = await axios.post(`${apiUrl}/mandates`, {
       mandates: {
         scheme: 'sepa_core',
@@ -827,7 +962,7 @@ app.post('/create-mandate-sandbox', async (req, res) => {
           customer_bank_account: bankAccountResponse.data.customer_bank_accounts.id,
           creditor: process.env.GOCARDLESS_CREDITOR_ID
         },
-        metadata: metadata || {}
+        metadata: limitedMetadata
       }
     }, {
       headers: {
@@ -867,16 +1002,24 @@ app.post('/create-mandate-sandbox', async (req, res) => {
       status: error.response?.status,
       statusText: error.response?.statusText,
       data: error.response?.data,
+      errors: error.response?.data?.error?.errors || error.response?.data?.errors || [],
       url: error.config?.url,
       headers: error.config?.headers,
       requestData: error.config?.data
     });
-    res.status(500).json({
+    
+    // Afficher les erreurs de validation en détail
+    if (error.response?.data?.error?.errors) {
+      console.error('[GoCardless] Erreurs de validation détaillées:', JSON.stringify(error.response.data.error.errors, null, 2));
+    }
+    
+    res.status(error.response?.status || 500).json({
       error: 'Erreur lors de la création du mandat GoCardless (sandbox)',
       details: error.response?.data || error.message,
       status: error.response?.status,
       url: error.config?.url,
-      requestData: error.config?.data
+      requestData: error.config?.data,
+      validationErrors: error.response?.data?.error?.errors || error.response?.data?.errors || []
     });
   }
 });
@@ -1983,7 +2126,8 @@ app.get('/api/yousign/status/:requestId', async (req, res) => {
 
     // Appel à l'API YouSign officielle
     console.log('[Yousign] Appel API YouSign avec clé:', process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE');
-    const apiUrl = `${process.env.YOUSIGN_API_URL}/v3/signature-requests/${requestId}`;
+    // Utiliser YOUSIGN_API_URL normalisé (déjà avec /v3) et signature_requests avec underscore
+    const apiUrl = `${YOUSIGN_API_URL}/signature_requests/${requestId}`;
     console.log('[Yousign] URL appelée:', apiUrl);
     
     const response = await axios.get(apiUrl, {
@@ -2126,7 +2270,8 @@ app.get('/api/yousign/download/:requestId', async (req, res) => {
 
     // Récupérer le document signé depuis YouSign
     console.log('[Yousign] Appel API YouSign documents avec clé:', process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE');
-    const documentsUrl = `${process.env.YOUSIGN_API_URL}/v3/signature-requests/${requestId}/documents`;
+    // Utiliser YOUSIGN_API_URL normalisé (déjà avec /v3) et signature_requests avec underscore
+    const documentsUrl = `${YOUSIGN_API_URL}/signature_requests/${requestId}/documents`;
     console.log('[Yousign] URL documents appelée:', documentsUrl);
     
     const response = await axios.get(documentsUrl, {
@@ -2143,8 +2288,9 @@ app.get('/api/yousign/download/:requestId', async (req, res) => {
     // Récupérer le premier document (normalement il n'y en a qu'un)
     const document = response.data[0];
     
-    // Télécharger le fichier signé
-    const downloadUrl = `${process.env.YOUSIGN_API_URL}/v3/documents/${document.id}/download`;
+    // Télécharger le fichier signé - utiliser la structure correcte de l'API YouSign
+    const downloadUrl = `${YOUSIGN_API_URL}/signature_requests/${requestId}/documents/${document.id}/download`;
+    console.log('[Yousign] URL download appelée:', downloadUrl);
     const fileResponse = await axios.get(downloadUrl, {
       headers: {
         'Authorization': `Bearer ${process.env.YOUSIGN_API_KEY}`
