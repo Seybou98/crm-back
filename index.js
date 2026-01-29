@@ -53,13 +53,13 @@ app.use(cors({
     // Log pour debug CORS
     console.log(`[CORS] Requête depuis origin: ${origin}`);
     console.log(`[CORS] Origins autorisés:`, allowedOrigins);
-    
+
     // Permettre les requêtes sans origin (applications mobiles, etc.)
     if (!origin) {
       console.log(`[CORS] Pas d'origin - autorisé`);
       return callback(null, true);
     }
-    
+
     if (allowedOrigins.includes(origin)) {
       console.log(`[CORS] Origin autorisé: ${origin}`);
       callback(null, true);
@@ -80,18 +80,18 @@ app.use('/', testRoutes);
 function validateIBAN(iban) {
   // Supprimer les espaces et convertir en majuscules
   const cleanIban = iban.replace(/\s/g, '').toUpperCase();
-  
+
   // Vérifier la longueur (FR = 27 caractères)
   if (cleanIban.length !== 27) {
     console.log('[GoCardless] IBAN invalide - longueur:', cleanIban.length, '(attendu: 27)');
     return false;
   }
-  
+
   // Vérifier le format français (FR + 2 chiffres + 10 caractères + 11 caractères alphanumériques)
   // Format: FR + 2 chiffres + 10 caractères alphanumériques + 11 caractères alphanumériques
   const ibanRegex = /^FR\d{2}[A-Z0-9]{10}[A-Z0-9]{11}$/;
   const isValid = ibanRegex.test(cleanIban);
-  
+
   // Log pour debug
   console.log('[GoCardless] Validation IBAN:', {
     iban: cleanIban,
@@ -99,31 +99,31 @@ function validateIBAN(iban) {
     regexMatch: ibanRegex.test(cleanIban),
     isValid: isValid
   });
-  
+
   if (!isValid) {
     console.log('[GoCardless] IBAN invalide - format:', cleanIban);
   }
-  
+
   return isValid;
 }
 
 // Fonction utilitaire pour obtenir l'URL de l'API GoCardless (AJOUTÉE)
 function getGoCardlessApiUrl() {
   const isProduction = process.env.GOCARDLESS_ACCESS_TOKEN?.startsWith('live_');
-  const apiUrl = isProduction 
-    ? 'https://api.gocardless.com' 
+  const apiUrl = isProduction
+    ? 'https://api.gocardless.com'
     : 'https://api-sandbox.gocardless.com';
-  
+
   console.log('[GoCardless] Environnement détecté:', isProduction ? 'production' : 'sandbox');
   console.log('[GoCardless] URL API utilisée:', apiUrl);
-  
+
   return apiUrl;
 }
 
 // Fonction pour convertir un nom de pays en code ISO (AJOUTÉE)
 function getCountryCode(countryName) {
   if (!countryName) return 'FR';
-  
+
   const countryMap = {
     'france': 'FR',
     'french': 'FR',
@@ -154,21 +154,21 @@ function getCountryCode(countryName) {
     'autriche': 'AT',
     'at': 'AT'
   };
-  
+
   const normalized = countryName.toLowerCase().trim();
   const code = countryMap[normalized];
-  
+
   if (code) {
     console.log(`[GoCardless] Conversion pays: "${countryName}" -> "${code}"`);
     return code;
   }
-  
+
   // Si c'est déjà un code à 2 lettres en majuscules, le retourner
   if (/^[A-Z]{2}$/.test(countryName.trim().toUpperCase())) {
     console.log(`[GoCardless] Code pays déjà valide: "${countryName}"`);
     return countryName.trim().toUpperCase();
   }
-  
+
   // Par défaut, retourner FR
   console.log(`[GoCardless] Pays non reconnu "${countryName}", utilisation de "FR" par défaut`);
   return 'FR';
@@ -201,7 +201,7 @@ const firebaseConfig = {
 let db = null;
 if (firebaseConfig.apiKey && firebaseConfig.projectId) {
   try {
-const firebaseApp = initializeApp(firebaseConfig);
+    const firebaseApp = initializeApp(firebaseConfig);
     db = getFirestore(firebaseApp);
     console.log('✅ Firebase initialisé avec succès');
   } catch (error) {
@@ -230,12 +230,12 @@ function validateGoCardlessWebhook(payload, signature) {
       .createHmac('sha256', GOCARDLESS_WEBHOOK_SECRET)
       .update(payload)
       .digest('hex');
-    
+
     const isValid = crypto.timingSafeEqual(
       Buffer.from(signature, 'hex'),
       Buffer.from(expectedSignature, 'hex')
     );
-    
+
     console.log('[Webhook] Validation signature:', { isValid, expected: expectedSignature, received: signature });
     return isValid;
   } catch (error) {
@@ -248,32 +248,32 @@ function validateGoCardlessWebhook(payload, signature) {
 async function findMaintenanceByPaymentId(paymentId) {
   try {
     console.log('[Webhook] Recherche maintenance pour paiement:', paymentId);
-    
+
     if (!db) {
       console.error('[Webhook] Firebase non disponible');
       return null;
     }
-    
+
     // ✅ Méthode 1 : Chercher dans goCardlessPaymentId (champ direct)
     const maintenancesRef = collection(db, 'maintenances');
     const q = query(maintenancesRef, where('goCardlessPaymentId', '==', paymentId));
     const snapshot = await getDocs(q);
-    
+
     if (!snapshot.empty) {
       const maintenance = snapshot.docs[0];
       console.log('[Webhook] Maintenance trouvée via goCardlessPaymentId:', maintenance.id, maintenance.data().clientName);
       return { id: maintenance.id, ...maintenance.data() };
     }
-    
+
     // ✅ Méthode 2 : Chercher dans paymentSchedule (plus fiable car c'est là qu'on stocke le paymentId)
     console.log('[Webhook] Recherche dans paymentSchedule...');
     const allMaintenancesSnapshot = await getDocs(maintenancesRef);
     console.log(`[Webhook] ${allMaintenancesSnapshot.docs.length} maintenances à vérifier`);
-    
+
     for (const docSnapshot of allMaintenancesSnapshot.docs) {
       const maintenance = docSnapshot.data();
       const paymentSchedule = maintenance.paymentSchedule || [];
-      
+
       // Chercher si le paymentId est dans le schedule
       const foundInSchedule = paymentSchedule.some(item => {
         const matches = item.gocardlessPaymentId === paymentId;
@@ -283,15 +283,15 @@ async function findMaintenanceByPaymentId(paymentId) {
         }
         return matches;
       });
-      
+
       if (foundInSchedule) {
         console.log('[Webhook] Maintenance trouvée via paymentSchedule:', docSnapshot.id, maintenance.clientName);
         return { id: docSnapshot.id, ...maintenance };
       }
     }
-    
+
     console.log(`[Webhook] ⚠️ PaymentId ${paymentId} non trouvé dans aucun paymentSchedule`);
-    
+
     console.log('[Webhook] Aucune maintenance trouvée pour le paiement:', paymentId);
     return null;
   } catch (error) {
@@ -304,25 +304,25 @@ async function findMaintenanceByPaymentId(paymentId) {
 async function updateMaintenancePaymentStatus(maintenanceId, newStatus, additionalData = {}) {
   try {
     console.log('[Webhook] 🔄 Mise à jour statut paiement:', { maintenanceId, newStatus, additionalData });
-    
+
     if (!db) {
       console.error('[Webhook] ❌ Firebase non disponible (db est null)');
       return false;
     }
-    
+
     const maintenanceRef = doc(db, 'maintenances', maintenanceId);
     const maintenanceDoc = await getDoc(maintenanceRef);
-    
+
     if (!maintenanceDoc.exists()) {
       console.error('[Webhook] ❌ Maintenance non trouvée:', maintenanceId);
       return false;
     }
-    
+
     const maintenance = maintenanceDoc.data();
     const paymentId = additionalData.goCardlessPaymentId || maintenance.goCardlessPaymentId;
-    
+
     console.log('[Webhook] 🔍 PaymentId à chercher dans schedule:', paymentId);
-    
+
     // ✅ NOUVEAU : Mapper le statut GoCardless vers le statut du paymentSchedule
     const scheduleStatusMapping = {
       'paid_out': 'paid',
@@ -333,17 +333,17 @@ async function updateMaintenancePaymentStatus(maintenanceId, newStatus, addition
       'submitted': 'processing',
       'pending_submission': 'pending'
     };
-    
+
     const scheduleStatus = scheduleStatusMapping[newStatus] || 'pending';
-    
+
     // ✅ NOUVEAU : Mettre à jour aussi le paymentSchedule
     const paymentSchedule = maintenance.paymentSchedule || [];
     console.log(`[Webhook] 📅 PaymentSchedule actuel: ${paymentSchedule.length} items`);
     console.log(`[Webhook] 🔍 Recherche paymentId "${paymentId}" dans schedule...`);
-    
+
     let scheduleUpdated = false;
     let foundInSchedule = false;
-    
+
     const updatedSchedule = paymentSchedule.map((item, index) => {
       if (item.gocardlessPaymentId === paymentId) {
         foundInSchedule = true;
@@ -359,7 +359,7 @@ async function updateMaintenancePaymentStatus(maintenanceId, newStatus, addition
       }
       return item;
     });
-    
+
     if (!foundInSchedule) {
       console.log(`[Webhook] ⚠️ PaymentId "${paymentId}" NON trouvé dans le schedule (${paymentSchedule.length} items)`);
       console.log(`[Webhook] 📋 PaymentIds présents dans schedule:`, paymentSchedule.map((item, idx) => ({
@@ -369,7 +369,7 @@ async function updateMaintenancePaymentStatus(maintenanceId, newStatus, addition
         status: item.status
       })).filter(item => item.paymentId));
     }
-    
+
     const updateData = {
       paymentStatus: newStatus,
       updatedAt: new Date(),
@@ -377,7 +377,7 @@ async function updateMaintenancePaymentStatus(maintenanceId, newStatus, addition
       ...additionalData,
       ...(scheduleUpdated && { paymentSchedule: updatedSchedule })
     };
-    
+
     console.log(`[Webhook] 💾 Mise à jour Firebase:`, {
       maintenanceId,
       newStatus,
@@ -385,9 +385,9 @@ async function updateMaintenancePaymentStatus(maintenanceId, newStatus, addition
       willUpdateSchedule: scheduleUpdated,
       scheduleLength: scheduleUpdated ? updatedSchedule.length : 'N/A'
     });
-    
+
     await updateDoc(maintenanceRef, updateData);
-    
+
     console.log('[Webhook] ✅ Statut paiement mis à jour avec succès:', { maintenanceId, newStatus, scheduleUpdated });
     return true;
   } catch (error) {
@@ -405,23 +405,23 @@ async function processGoCardlessPaymentEvent(event) {
       action: event.action,
       paymentId: event.links?.payment
     });
-    
+
     // ✅ CORRECTION : GoCardless peut envoyer 'payment' ou 'payments' comme resource_type
     const isPaymentEvent = event.resource_type === 'payment' || event.resource_type === 'payments';
     if (!isPaymentEvent || !event.links?.payment) {
       console.log('[Webhook] ❌ Événement ignoré (pas un paiement):', event.resource_type);
       return false;
     }
-    
+
     console.log('[Webhook] ✅ Événement paiement détecté:', {
       resourceType: event.resource_type,
       action: event.action,
       paymentId: event.links.payment
     });
-    
+
     const paymentId = event.links.payment;
     const action = event.action;
-    
+
     // Mapping des actions GoCardless vers nos statuts
     const statusMapping = {
       'confirmed': 'confirmed',
@@ -432,13 +432,13 @@ async function processGoCardlessPaymentEvent(event) {
       'submitted': 'submitted',
       'pending_submission': 'pending_submission'
     };
-    
+
     const newStatus = statusMapping[action];
     if (!newStatus) {
       console.log('[Webhook] Action non mappée:', action);
       return false;
     }
-    
+
     // Trouver la maintenance correspondante
     console.log(`[Webhook] 🔍 Recherche maintenance pour paymentId: ${paymentId}`);
     const maintenance = await findMaintenanceByPaymentId(paymentId);
@@ -446,9 +446,9 @@ async function processGoCardlessPaymentEvent(event) {
       console.log(`[Webhook] ❌ Maintenance non trouvée pour le paiement: ${paymentId}`);
       return false;
     }
-    
+
     console.log(`[Webhook] ✅ Maintenance trouvée: ${maintenance.id} (${maintenance.clientName || 'N/A'})`);
-    
+
     // Mettre à jour le statut
     const success = await updateMaintenancePaymentStatus(maintenance.id, newStatus, {
       goCardlessPaymentId: paymentId, // ✅ NOUVEAU : Passer le paymentId pour mettre à jour le schedule
@@ -456,9 +456,9 @@ async function processGoCardlessPaymentEvent(event) {
       goCardlessEventAction: action,
       goCardlessEventCreatedAt: event.created_at
     });
-    
+
     console.log(`[Webhook] 📊 Résultat mise à jour: ${success ? '✅ Succès' : '❌ Échec'}`);
-    
+
     if (success) {
       console.log('[Webhook] Événement traité avec succès:', {
         maintenanceId: maintenance.id,
@@ -468,7 +468,7 @@ async function processGoCardlessPaymentEvent(event) {
         action: action
       });
     }
-    
+
     return success;
   } catch (error) {
     console.error('[Webhook] Erreur traitement événement paiement:', error);
@@ -530,9 +530,9 @@ async function addSigner(signatureRequestId, documentId, firstName, lastName, em
     width: 200,     // Largeur du champ de signature
     height: 60      // Hauteur du champ de signature
   };
-  
+
   const position = signaturePosition || defaultPosition;
-  
+
   const res = await yousignApi.post(
     `/signature_requests/${signatureRequestId}/signers`,
     {
@@ -720,7 +720,7 @@ app.get('/api/yousign/signature-request/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const signatureRequest = await getSignatureRequest(id);
-    
+
     // Extraire le statut de signature pour chaque signataire
     const signatureStatus = signatureRequest.signers?.map(signer => ({
       id: signer.id,
@@ -731,7 +731,7 @@ app.get('/api/yousign/signature-request/:id', async (req, res) => {
       signedAt: signer.signed_at,
       signatureLink: signer.signature_link
     })) || [];
-    
+
     res.json({
       id: signatureRequest.id,
       name: signatureRequest.name,
@@ -779,7 +779,7 @@ app.get('/api/yousign/signature-request/:id/document', async (req, res) => {
 // POST : Endpoint pour les devis SAV (signature électronique)
 app.post('/api/yousign-devis', async (req, res) => {
   console.log('\n🔷 ====== REQUÊTE YOUSIGN DEVIS SAV ======');
-  
+
   try {
     const { action, ...data } = req.body;
     console.log('[Yousign-Devis] Action:', action);
@@ -824,7 +824,7 @@ app.post('/api/yousign-devis', async (req, res) => {
           contentType: 'application/pdf'
         });
         form.append('nature', 'signable_document');
-        
+
         const uploadRes = await axios.post(
           `${YOUSIGN_API_URL}/signature_requests/${signatureRequestId}/documents`,
           form,
@@ -835,7 +835,7 @@ app.post('/api/yousign-devis', async (req, res) => {
 
         // 3. Ajouter le signataire
         console.log('[Yousign-Devis] Ajout du signataire...');
-        
+
         // Préparer les infos du signataire (sans téléphone si invalide)
         const signerInfo = {
           first_name: signer.firstName || 'Client',
@@ -843,7 +843,7 @@ app.post('/api/yousign-devis', async (req, res) => {
           email: signer.email,
           locale: 'fr'
         };
-        
+
         // Ajouter le téléphone seulement s'il est valide (format international +33...)
         if (signer.phone) {
           // Nettoyer et formater le numéro
@@ -860,18 +860,18 @@ app.post('/api/yousign-devis', async (req, res) => {
             console.log('[Yousign-Devis] Téléphone ignoré (format invalide):', signer.phone);
           }
         }
-        
+
         // Calculer les coordonnées pour positionner la signature dans la zone "Le client"
         // Pour un PDF A4 standard : 595 points de largeur x 842 points de hauteur
         // IMPORTANT: Les coordonnées Yousign sont depuis le HAUT de la page (y=0 en haut)
         // La signature est maintenant positionnée EN BAS du document, juste avant le footer
         // (après les conditions générales, avant le footer)
         // La signature doit être SUR la ligne de signature du client, pas en dessous
-        
+
         // Dimensions A4 en points (1 point = 1/72 inch)
         const A4_WIDTH = 595;
         const A4_HEIGHT = 842;
-        
+
         // Calcul de la position de la ligne de signature
         // Le template a maintenant :
         // - Header avec logo: ~80-100 points
@@ -881,7 +881,7 @@ app.post('/api/yousign-devis', async (req, res) => {
         // - Conditions générales: ~400-550 points
         // - Section signature: ~550-700 points (environ 65-83% de la hauteur) - À LA FIN
         // - Footer: ~700-842 points
-        
+
         // Position de la zone de signature du client (section gauche)
         // x: zone gauche du document (environ 8% de la largeur pour la colonne gauche)
         // y: SUR la ligne de signature (border-top), positionnée en bas du document (après les conditions)
@@ -904,17 +904,17 @@ app.post('/api/yousign-devis', async (req, res) => {
         // Pour remonter : réduire le pourcentage (ex: 0.70 au lieu de 0.75)
         // Pour descendre : augmenter le pourcentage (ex: 0.80 au lieu de 0.75)
         const sectionStartY = Math.round(A4_HEIGHT * 0.60); // ~589 points - début de la section signatures (remonté)
-        
+
         // Conversion CSS vers points PDF (1px CSS ≈ 0.75 points PDF à 96 DPI)
         // .signature-box : padding-top: 40px ≈ 30 points
         const signatureBoxPadding = Math.round(40 * 0.75); // 30 points
-        
+
         // .signature-line : margin-top: 30px ≈ 22 points
         const signatureLineMargin = Math.round(30 * 0.75); // 22 points
-        
+
         // Position exacte de la ligne border-top
         const linePosition = sectionStartY + signatureBoxPadding + signatureLineMargin; // ~684 points
-        
+
         // IMPORTANT: Yousign positionne le coin supérieur gauche de la zone de signature
         // Pour que la signature soit SUR la ligne border-top, il faut :
         // - Positionner Y légèrement au-dessus de la ligne pour que le texte soit sur la ligne
@@ -923,7 +923,7 @@ app.post('/api/yousign-devis', async (req, res) => {
         // NOTE: Yousign exige une hauteur minimale de 37 points
         const signatureHeight = 37; // Hauteur minimale requise par Yousign
         const yOffset = 25; // Offset pour positionner le texte sur la ligne
-        
+
         const signatureField = {
           type: 'signature',
           document_id: documentId,
@@ -934,7 +934,7 @@ app.post('/api/yousign-devis', async (req, res) => {
           height: signatureHeight,               // Hauteur de la zone
           label: 'Signature du client'           // Label descriptif
         };
-        
+
         console.log('[Yousign-Devis] Zone de signature configurée pour la zone "Le client":', {
           ...signatureField,
           position: `(${signatureField.x}, ${signatureField.y})`,
@@ -951,7 +951,7 @@ app.post('/api/yousign-devis', async (req, res) => {
           },
           note: `Signature positionnée à Y=${signatureField.y} (ligne à ${linePosition}). Le texte Yousign apparaîtra ~5-10 points sous Y, donc sur la ligne. Si besoin, ajuster yOffset (actuellement ${yOffset}).`
         });
-        
+
         const signerRes = await yousignApi.post(
           `/signature_requests/${signatureRequestId}/signers`,
           {
@@ -977,10 +977,10 @@ app.post('/api/yousign-devis', async (req, res) => {
         let sumupPaymentUrl = null;
         let sumupCheckoutId = null;
         let sumupError = null;
-        
+
         try {
           console.log('[Yousign-Devis] Création automatique du lien de paiement SumUp...');
-          
+
           // Vérifier si on a les informations nécessaires pour SumUp
           if (signerInfo.email && data.amount) {
             const sumupCheckoutData = {
@@ -993,7 +993,7 @@ app.post('/api/yousign-devis', async (req, res) => {
             };
 
             const sumupResult = await sumupService.createCheckout(sumupCheckoutData);
-            
+
             if (sumupResult.success) {
               sumupPaymentUrl = sumupResult.payment_url;
               sumupCheckoutId = sumupResult.checkout_id;
@@ -1048,10 +1048,10 @@ app.post('/api/yousign-devis', async (req, res) => {
       case 'get_status': {
         const { signatureRequestId } = data;
         console.log('[Yousign-Devis] Vérification statut:', signatureRequestId);
-        
+
         const statusRes = await yousignApi.get(`/signature_requests/${signatureRequestId}`);
         const status = statusRes.data;
-        
+
         return res.json({
           success: true,
           status: status.status,
@@ -1067,14 +1067,14 @@ app.post('/api/yousign-devis', async (req, res) => {
       case 'download_signed': {
         const { signatureRequestId, documentId } = data;
         console.log('[Yousign-Devis] Téléchargement document signé:', signatureRequestId);
-        
+
         const docRes = await yousignApi.get(
           `/signature_requests/${signatureRequestId}/documents/${documentId}/download`,
           { responseType: 'arraybuffer' }
         );
-        
+
         const pdfBase64 = Buffer.from(docRes.data).toString('base64');
-        
+
         return res.json({
           success: true,
           pdfBase64
@@ -1148,7 +1148,7 @@ app.post('/create-mandate', async (req, res) => {
 
     // Vérifier le token
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant',
         message: 'Ajoutez votre token d\'accès dans le fichier .env'
       });
@@ -1156,7 +1156,7 @@ app.post('/create-mandate', async (req, res) => {
 
     // Vérifier le Creditor ID (AJOUTÉ)
     if (!process.env.GOCARDLESS_CREDITOR_ID) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_CREDITOR_ID manquant',
         message: 'Ajoutez votre Creditor ID dans le fichier .env'
       });
@@ -1179,7 +1179,7 @@ app.post('/create-mandate', async (req, res) => {
       });
 
       const creditor = creditorResponse.data.creditors;
-      
+
       if (!creditor.activated) {
         console.log('[GoCardless] Warning: Creditor non activé, mais continuation pour les tests');
         // Ne pas bloquer, juste logger un warning
@@ -1191,7 +1191,7 @@ app.post('/create-mandate', async (req, res) => {
       }
 
       console.log('[GoCardless] Creditor vérifié:', creditor.name, '- Statut:', creditor.verification_status);
-      
+
     } catch (creditorError) {
       console.error('[GoCardless] Erreur vérification creditor:', creditorError.response?.data || creditorError.message);
       return res.status(500).json({
@@ -1228,14 +1228,14 @@ app.post('/create-mandate', async (req, res) => {
     const cleanIban = iban.replace(/\s/g, '').toUpperCase();
     const cleanAccountHolderName = account_holder_name.trim();
     const customerId = customerResponse.data.customers.id;
-    
+
     console.log('[GoCardless] Création du compte bancaire:', {
       account_holder_name: cleanAccountHolderName,
       iban: cleanIban,
       ibanLength: cleanIban.length,
       customerId: customerId
     });
-    
+
     const bankAccountResponse = await axios.post(`${apiUrl}/customer_bank_accounts`, {
       customer_bank_accounts: {
         account_holder_name: cleanAccountHolderName,
@@ -1260,9 +1260,9 @@ app.post('/create-mandate', async (req, res) => {
       maintenanceId: metadata?.maintenanceId || '',
       clientId: metadata?.clientId || ''
     };
-    
+
     console.log('[GoCardless] Métadonnées limitées à 3 propriétés:', limitedMetadata);
-    
+
     const mandateResponse = await axios.post(`${apiUrl}/mandates`, {
       mandates: {
         scheme: 'sepa_core',
@@ -1314,12 +1314,12 @@ app.post('/create-mandate', async (req, res) => {
       headers: error.config?.headers,
       requestData: error.config?.data
     });
-    
+
     // Afficher les erreurs de validation en détail
     if (error.response?.data?.error?.errors) {
       console.error('[GoCardless] Erreurs de validation détaillées:', JSON.stringify(error.response.data.error.errors, null, 2));
     }
-    
+
     res.status(error.response?.status || 500).json({
       error: 'Erreur lors de la création du mandat GoCardless',
       details: error.response?.data || error.message,
@@ -1352,7 +1352,7 @@ app.post('/create-mandate-sandbox', async (req, res) => {
 
     // Vérifier le token
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant',
         message: 'Ajoutez votre token d\'accès dans le fichier .env'
       });
@@ -1360,7 +1360,7 @@ app.post('/create-mandate-sandbox', async (req, res) => {
 
     // Vérifier le Creditor ID (AJOUTÉ)
     if (!process.env.GOCARDLESS_CREDITOR_ID) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_CREDITOR_ID manquant',
         message: 'Ajoutez votre Creditor ID dans le fichier .env'
       });
@@ -1399,14 +1399,14 @@ app.post('/create-mandate-sandbox', async (req, res) => {
     const cleanIban = iban.replace(/\s/g, '').toUpperCase();
     const cleanAccountHolderName = account_holder_name.trim();
     const customerId = customerResponse.data.customers.id;
-    
+
     console.log('[GoCardless] Création du compte bancaire (sandbox):', {
       account_holder_name: cleanAccountHolderName,
       iban: cleanIban,
       ibanLength: cleanIban.length,
       customerId: customerId
     });
-    
+
     const bankAccountResponse = await axios.post(`${apiUrl}/customer_bank_accounts`, {
       customer_bank_accounts: {
         account_holder_name: cleanAccountHolderName,
@@ -1431,9 +1431,9 @@ app.post('/create-mandate-sandbox', async (req, res) => {
       maintenanceId: metadata?.maintenanceId || '',
       clientId: metadata?.clientId || ''
     };
-    
+
     console.log('[GoCardless] Métadonnées limitées à 3 propriétés (sandbox):', limitedMetadata);
-    
+
     const mandateResponse = await axios.post(`${apiUrl}/mandates`, {
       mandates: {
         scheme: 'sepa_core',
@@ -1486,12 +1486,12 @@ app.post('/create-mandate-sandbox', async (req, res) => {
       headers: error.config?.headers,
       requestData: error.config?.data
     });
-    
+
     // Afficher les erreurs de validation en détail
     if (error.response?.data?.error?.errors) {
       console.error('[GoCardless] Erreurs de validation détaillées:', JSON.stringify(error.response.data.error.errors, null, 2));
     }
-    
+
     res.status(error.response?.status || 500).json({
       error: 'Erreur lors de la création du mandat GoCardless (sandbox)',
       details: error.response?.data || error.message,
@@ -1507,17 +1507,17 @@ app.post('/create-mandate-sandbox', async (req, res) => {
 app.get('/diagnose-gocardless', async (req, res) => {
   try {
     console.log('[GoCardless] Diagnostic de la configuration...');
-    
+
     const config = {
       hasAccessToken: !!process.env.GOCARDLESS_ACCESS_TOKEN,
       hasCreditorId: !!process.env.GOCARDLESS_CREDITOR_ID,
-      accessTokenType: process.env.GOCARDLESS_ACCESS_TOKEN ? 
+      accessTokenType: process.env.GOCARDLESS_ACCESS_TOKEN ?
         (process.env.GOCARDLESS_ACCESS_TOKEN.startsWith('live_') ? 'production' : 'sandbox') : 'missing',
       creditorId: process.env.GOCARDLESS_CREDITOR_ID || 'missing'
     };
-    
+
     console.log('[GoCardless] Configuration:', config);
-    
+
     if (!config.hasAccessToken) {
       return res.json({
         success: false,
@@ -1525,7 +1525,7 @@ app.get('/diagnose-gocardless', async (req, res) => {
         config
       });
     }
-    
+
     if (!config.hasCreditorId) {
       return res.json({
         success: false,
@@ -1533,7 +1533,7 @@ app.get('/diagnose-gocardless', async (req, res) => {
         config
       });
     }
-    
+
     // Tester la connexion avec l'API
     const apiUrl = getGoCardlessApiUrl();
     const response = await axios.get(`${apiUrl}/creditors`, {
@@ -1543,7 +1543,7 @@ app.get('/diagnose-gocardless', async (req, res) => {
         'Content-Type': 'application/json'
       }
     });
-    
+
     res.json({
       success: true,
       message: 'Configuration GoCardless valide',
@@ -1553,7 +1553,7 @@ app.get('/diagnose-gocardless', async (req, res) => {
         creditors: response.data.creditors?.length || 0
       }
     });
-    
+
   } catch (error) {
     console.error('[GoCardless] Erreur diagnostic:', error.response?.data || error.message);
     res.json({
@@ -1562,7 +1562,7 @@ app.get('/diagnose-gocardless', async (req, res) => {
       config: {
         hasAccessToken: !!process.env.GOCARDLESS_ACCESS_TOKEN,
         hasCreditorId: !!process.env.GOCARDLESS_CREDITOR_ID,
-        accessTokenType: process.env.GOCARDLESS_ACCESS_TOKEN ? 
+        accessTokenType: process.env.GOCARDLESS_ACCESS_TOKEN ?
           (process.env.GOCARDLESS_ACCESS_TOKEN.startsWith('live_') ? 'production' : 'sandbox') : 'missing'
       },
       error: error.response?.data || error.message,
@@ -1575,7 +1575,7 @@ app.get('/diagnose-gocardless', async (req, res) => {
 app.get('/test-gocardless', async (req, res) => {
   try {
     console.log('[GoCardless] Test de connexion...');
-    
+
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
       return res.json({
         success: false,
@@ -1629,9 +1629,9 @@ app.get('/test-gocardless', async (req, res) => {
 app.get('/get-creditors', async (req, res) => {
   try {
     console.log('[GoCardless] Récupération des créanciers...');
-    
+
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant',
         message: 'Ajoutez votre token d\'accès dans le fichier .env'
       });
@@ -1667,29 +1667,29 @@ app.post('/create-payment', async (req, res) => {
     if (!amount || !currency || !mandate_id) {
       return res.status(400).json({ error: 'amount, currency et mandate_id sont requis' });
     }
-    
+
     // ✅ NOUVEAU : Calculer charge_date si non fourni
     let paymentChargeDate = charge_date;
     if (!paymentChargeDate && metadata?.dueDate) {
       paymentChargeDate = metadata.dueDate;
     }
-    
+
     // ✅ CORRECTION : Valider et ajuster la date selon les règles GoCardless
     const today = new Date();
     today.setHours(0, 0, 0, 0); // Réinitialiser l'heure pour la comparaison
-    
+
     if (paymentChargeDate) {
       const chargeDateObj = new Date(paymentChargeDate);
       chargeDateObj.setHours(0, 0, 0, 0);
-      
+
       // Minimum 3 jours dans le futur pour SEPA
       const minDate = new Date(today);
       minDate.setDate(minDate.getDate() + 3);
-      
+
       // Maximum 1 an dans le futur
       const maxDate = new Date(today);
       maxDate.setFullYear(maxDate.getFullYear() + 1);
-      
+
       if (chargeDateObj < minDate) {
         console.warn(`[GoCardless] Date de prélèvement trop proche (${paymentChargeDate}), minimum 3 jours requis. Ajustement à: ${minDate.toISOString().split('T')[0]}`);
         paymentChargeDate = minDate.toISOString().split('T')[0];
@@ -1703,11 +1703,11 @@ app.post('/create-payment', async (req, res) => {
       minDate.setDate(minDate.getDate() + 3);
       paymentChargeDate = minDate.toISOString().split('T')[0];
     }
-    
+
     console.log('[GoCardless] Date de prélèvement calculée:', paymentChargeDate);
 
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant'
       });
     }
@@ -1724,14 +1724,14 @@ app.post('/create-payment', async (req, res) => {
       });
 
       const creditor = creditorResponse.data.creditors;
-      
+
       if (!creditor.collections_permitted) {
         console.log('[GoCardless] Warning: Collections non permises sur le creditor');
         // Ne pas bloquer, juste logger un warning
       } else {
         console.log('[GoCardless] Creditor vérifié - collections permises');
       }
-      
+
     } catch (creditorError) {
       console.error('[GoCardless] Erreur vérification creditor:', creditorError.response?.data || creditorError.message);
       console.log('[GoCardless] Poursuite sans vérification du creditor - tentative de création de paiement');
@@ -1741,10 +1741,10 @@ app.post('/create-payment', async (req, res) => {
     // Vérifier que le mandat existe et est actif (AJOUTÉ) - avec délai
     try {
       const apiUrl = getGoCardlessApiUrl();
-      
+
       // Attendre un peu que le mandat soit disponible dans l'API
       await new Promise(resolve => setTimeout(resolve, 2000));
-      
+
       const mandateResponse = await axios.get(`${apiUrl}/mandates/${mandate_id}`, {
         headers: {
           'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
@@ -1754,7 +1754,7 @@ app.post('/create-payment', async (req, res) => {
       });
 
       const mandate = mandateResponse.data.mandates;
-      
+
       if (mandate.status !== 'active') {
         console.log('[GoCardless] Mandat trouvé mais non actif:', mandate.status);
         // Ne pas bloquer si le mandat existe mais n'est pas encore actif
@@ -1762,7 +1762,7 @@ app.post('/create-payment', async (req, res) => {
       } else {
         console.log('[GoCardless] Mandat vérifié et actif:', mandate.id);
       }
-      
+
     } catch (mandateError) {
       console.error('[GoCardless] Erreur vérification mandat:', mandateError.response?.data || mandateError.message);
       // Ne pas bloquer la création de paiement si la vérification échoue
@@ -1773,50 +1773,50 @@ app.post('/create-payment', async (req, res) => {
 
     // ✅ NOUVEAU : Construire l'objet paiement avec charge_date
     const paymentData = {
-        amount: Math.round(amount * 100), // ✅ Conversion en centimes + arrondi à l'entier
-        currency,
-        links: {
-          mandate: mandate_id
-        },
-        description: description || 'Paiement de maintenance',
-        metadata: {
-          reference: reference || 'PAYMENT_CREATED',
-          // ✅ CORRECTION : GoCardless limite les métadonnées à 3 propriétés maximum
-          // On garde seulement les plus importantes : reference, maintenance_id, et type
-          // Les autres informations (due_date, test, test_cycle) sont supprimées ou combinées
-          ...(metadata ? (() => {
-            const processed = {};
-            let count = 1; // reference compte déjà comme 1
-            
-            // Priorité 1 : maintenance_id (important pour identifier la maintenance)
-            if (metadata.maintenanceId && count < 3) {
-              processed.maintenance_id = String(metadata.maintenanceId);
+      amount: Math.round(amount * 100), // ✅ Conversion en centimes + arrondi à l'entier
+      currency,
+      links: {
+        mandate: mandate_id
+      },
+      description: description || 'Paiement de maintenance',
+      metadata: {
+        reference: reference || 'PAYMENT_CREATED',
+        // ✅ CORRECTION : GoCardless limite les métadonnées à 3 propriétés maximum
+        // On garde seulement les plus importantes : reference, maintenance_id, et type
+        // Les autres informations (due_date, test, test_cycle) sont supprimées ou combinées
+        ...(metadata ? (() => {
+          const processed = {};
+          let count = 1; // reference compte déjà comme 1
+
+          // Priorité 1 : maintenance_id (important pour identifier la maintenance)
+          if (metadata.maintenanceId && count < 3) {
+            processed.maintenance_id = String(metadata.maintenanceId);
+            count++;
+          }
+
+          // Priorité 2 : type (important pour le type de paiement)
+          if (metadata.type && count < 3) {
+            processed.type = String(metadata.type);
+            count++;
+          }
+
+          // Si on a encore de la place, on peut combiner due_date et autres infos dans une seule clé
+          if (count < 3 && (metadata.dueDate || metadata.test || metadata.testCycle)) {
+            const extraInfo = [];
+            if (metadata.dueDate) extraInfo.push(`due:${metadata.dueDate}`);
+            if (metadata.test) extraInfo.push(`test:${metadata.test}`);
+            if (metadata.testCycle) extraInfo.push(`cycle:${metadata.testCycle}`);
+            if (extraInfo.length > 0) {
+              processed.extra = extraInfo.join('|');
               count++;
             }
-            
-            // Priorité 2 : type (important pour le type de paiement)
-            if (metadata.type && count < 3) {
-              processed.type = String(metadata.type);
-              count++;
-            }
-            
-            // Si on a encore de la place, on peut combiner due_date et autres infos dans une seule clé
-            if (count < 3 && (metadata.dueDate || metadata.test || metadata.testCycle)) {
-              const extraInfo = [];
-              if (metadata.dueDate) extraInfo.push(`due:${metadata.dueDate}`);
-              if (metadata.test) extraInfo.push(`test:${metadata.test}`);
-              if (metadata.testCycle) extraInfo.push(`cycle:${metadata.testCycle}`);
-              if (extraInfo.length > 0) {
-                processed.extra = extraInfo.join('|');
-                count++;
-              }
-            }
-            
-            return processed;
-          })() : {})
-        }
+          }
+
+          return processed;
+        })() : {})
+      }
     };
-    
+
     // ✅ NOUVEAU : Ajouter charge_date si fourni (format YYYY-MM-DD requis par GoCardless)
     if (paymentChargeDate) {
       paymentData.charge_date = paymentChargeDate;
@@ -1838,7 +1838,7 @@ app.post('/create-payment', async (req, res) => {
     const paymentId = response.data.payments.id;
     const paymentStatus = response.data.payments.status;
     console.log(`[GoCardless] 💳 Paiement créé: ${paymentId}, status: ${paymentStatus}`);
-    
+
     // ✅ DIAGNOSTIC : Logs pour comprendre pourquoi la sauvegarde ne se fait pas
     console.log('\n========================================');
     console.log(`[GoCardless] 🔍 DIAGNOSTIC SAUVEGARDE paymentId ${paymentId}`);
@@ -1853,7 +1853,7 @@ app.post('/create-payment', async (req, res) => {
       console.log(`[GoCardless] metadataFull:`, JSON.stringify(metadata, null, 2));
     }
     console.log('========================================\n');
-    
+
     // ✅ NOUVEAU : Sauvegarder le paymentId dans le paymentSchedule si maintenanceId est fourni
     if (!metadata?.maintenanceId) {
       console.log(`[GoCardless] ⚠️ Pas de maintenanceId dans metadata, sauvegarde annulée`);
@@ -1862,33 +1862,33 @@ app.post('/create-payment', async (req, res) => {
     if (!db) {
       console.log(`[GoCardless] ⚠️ Firebase non disponible (db est null), sauvegarde annulée`);
     }
-    
+
     if (metadata?.maintenanceId && db) {
       console.log(`[GoCardless] ✅ Conditions remplies, début sauvegarde dans schedule...`);
       try {
         const maintenanceId = metadata.maintenanceId;
         const maintenanceRef = doc(db, 'maintenances', maintenanceId);
         const maintenanceDoc = await getDoc(maintenanceRef);
-        
+
         if (maintenanceDoc.exists()) {
           const maintenance = maintenanceDoc.data();
           const paymentSchedule = maintenance.paymentSchedule || [];
-          
+
           console.log(`[GoCardless] 📅 Tentative sauvegarde paymentId ${paymentId} dans schedule (${paymentSchedule.length} items)`);
           console.log(`[GoCardless] 📅 Date de charge: ${paymentChargeDate}`);
-          
+
           let foundMatch = false;
           let scheduleUpdated = false;
-          
+
           // Mettre à jour le schedule avec le paymentId
           console.log(`[GoCardless] 🔍 Recherche dans ${paymentSchedule.length} items du schedule...`);
           const updatedSchedule = paymentSchedule.map((item, index) => {
             // Chercher par dueDate (si fourni dans metadata) ou par charge_date
             const itemDueDate = item.dueDate ? item.dueDate.substring(0, 10) : null;
             const chargeDateStr = paymentChargeDate ? paymentChargeDate.substring(0, 10) : null;
-            
+
             console.log(`[GoCardless]   Item[${index}]: dueDate=${itemDueDate}, chargeDate=${chargeDateStr}, status=${item.status}, paymentId=${item.gocardlessPaymentId || 'N/A'}`);
-            
+
             // ✅ AMÉLIORATION : Chercher aussi les items "pending" ou "processing" sans paymentId
             if (chargeDateStr && itemDueDate === chargeDateStr) {
               foundMatch = true;
@@ -1901,22 +1901,22 @@ app.post('/create-payment', async (req, res) => {
                 updatedAt: new Date().toISOString()
               };
             }
-            
+
             // ✅ NOUVEAU : Si l'item est "pending" ou "processing" sans paymentId, et que la date est proche (même mois)
             if (!item.gocardlessPaymentId && (item.status === 'pending' || item.status === 'processing')) {
               const itemDueDate = item.dueDate ? item.dueDate.substring(0, 10) : null;
               const chargeDateStr = paymentChargeDate ? paymentChargeDate.substring(0, 10) : null;
-              
+
               if (itemDueDate && chargeDateStr) {
                 // Comparer année-mois (tolérance pour les dates proches)
                 const itemYearMonth = itemDueDate.substring(0, 7);
                 const chargeYearMonth = chargeDateStr.substring(0, 7);
-                
+
                 if (itemYearMonth === chargeYearMonth) {
                   const itemDay = parseInt(itemDueDate.substring(8, 10));
                   const chargeDay = parseInt(chargeDateStr.substring(8, 10));
                   const dayDiff = Math.abs(itemDay - chargeDay);
-                  
+
                   // Si la différence est de 7 jours ou moins, considérer comme match
                   if (dayDiff <= 7) {
                     foundMatch = true;
@@ -1932,10 +1932,10 @@ app.post('/create-payment', async (req, res) => {
                 }
               }
             }
-            
+
             return item;
           });
-          
+
           // Si aucun item trouvé, ajouter un nouveau (seulement si dueDate est fourni)
           if (paymentChargeDate && !foundMatch) {
             console.log(`[GoCardless] ⚠️ Aucun item trouvé dans schedule, ajout d'un nouveau pour ${paymentChargeDate}`);
@@ -1951,7 +1951,7 @@ app.post('/create-payment', async (req, res) => {
             updatedSchedule.push(newPayment);
             scheduleUpdated = true;
           }
-          
+
           // Sauvegarder si on a trouvé ou ajouté un item
           if (scheduleUpdated) {
             await updateDoc(maintenanceRef, {
@@ -1996,7 +1996,7 @@ app.post('/create-payment', async (req, res) => {
       }
       console.error('\n========================================\n');
     }
-    
+
     console.error('[GoCardless] Erreur création paiement complète:', {
       message: error.message,
       status: error.response?.status,
@@ -2005,7 +2005,7 @@ app.post('/create-payment', async (req, res) => {
       url: error.config?.url,
       requestData: error.config?.data
     });
-    
+
     res.status(error.response?.status || 500).json({
       error: 'Erreur lors de la création du paiement GoCardless',
       details: error.response?.data || error.message,
@@ -2030,29 +2030,29 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
     if (!amount || !currency || !mandate_id) {
       return res.status(400).json({ error: 'amount, currency et mandate_id sont requis' });
     }
-    
+
     // ✅ NOUVEAU : Calculer charge_date si non fourni
     let paymentChargeDate = charge_date;
     if (!paymentChargeDate && metadata?.dueDate) {
       paymentChargeDate = metadata.dueDate;
     }
-    
+
     // ✅ CORRECTION : Valider et ajuster la date selon les règles GoCardless
     const today = new Date();
     today.setHours(0, 0, 0, 0); // Réinitialiser l'heure pour la comparaison
-    
+
     if (paymentChargeDate) {
       const chargeDateObj = new Date(paymentChargeDate);
       chargeDateObj.setHours(0, 0, 0, 0);
-      
+
       // Minimum 3 jours dans le futur pour SEPA
       const minDate = new Date(today);
       minDate.setDate(minDate.getDate() + 3);
-      
+
       // Maximum 1 an dans le futur
       const maxDate = new Date(today);
       maxDate.setFullYear(maxDate.getFullYear() + 1);
-      
+
       if (chargeDateObj < minDate) {
         console.warn(`[GoCardless] Date de prélèvement trop proche (${paymentChargeDate}), minimum 3 jours requis. Ajustement à: ${minDate.toISOString().split('T')[0]}`);
         paymentChargeDate = minDate.toISOString().split('T')[0];
@@ -2066,11 +2066,11 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
       minDate.setDate(minDate.getDate() + 3);
       paymentChargeDate = minDate.toISOString().split('T')[0];
     }
-    
+
     console.log('[GoCardless] Date de prélèvement calculée:', paymentChargeDate);
 
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant'
       });
     }
@@ -2079,50 +2079,50 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
 
     // ✅ NOUVEAU : Construire l'objet paiement avec charge_date
     const paymentData = {
-        amount: Math.round(amount * 100), // ✅ Conversion en centimes + arrondi à l'entier
-        currency,
-        links: {
-          mandate: mandate_id
-        },
-        description: description || 'Paiement de maintenance',
-        metadata: {
-          reference: reference || 'PAYMENT_CREATED',
-          // ✅ CORRECTION : GoCardless limite les métadonnées à 3 propriétés maximum
-          // On garde seulement les plus importantes : reference, maintenance_id, et type
-          // Les autres informations (due_date, test, test_cycle) sont supprimées ou combinées
-          ...(metadata ? (() => {
-            const processed = {};
-            let count = 1; // reference compte déjà comme 1
-            
-            // Priorité 1 : maintenance_id (important pour identifier la maintenance)
-            if (metadata.maintenanceId && count < 3) {
-              processed.maintenance_id = String(metadata.maintenanceId);
+      amount: Math.round(amount * 100), // ✅ Conversion en centimes + arrondi à l'entier
+      currency,
+      links: {
+        mandate: mandate_id
+      },
+      description: description || 'Paiement de maintenance',
+      metadata: {
+        reference: reference || 'PAYMENT_CREATED',
+        // ✅ CORRECTION : GoCardless limite les métadonnées à 3 propriétés maximum
+        // On garde seulement les plus importantes : reference, maintenance_id, et type
+        // Les autres informations (due_date, test, test_cycle) sont supprimées ou combinées
+        ...(metadata ? (() => {
+          const processed = {};
+          let count = 1; // reference compte déjà comme 1
+
+          // Priorité 1 : maintenance_id (important pour identifier la maintenance)
+          if (metadata.maintenanceId && count < 3) {
+            processed.maintenance_id = String(metadata.maintenanceId);
+            count++;
+          }
+
+          // Priorité 2 : type (important pour le type de paiement)
+          if (metadata.type && count < 3) {
+            processed.type = String(metadata.type);
+            count++;
+          }
+
+          // Si on a encore de la place, on peut combiner due_date et autres infos dans une seule clé
+          if (count < 3 && (metadata.dueDate || metadata.test || metadata.testCycle)) {
+            const extraInfo = [];
+            if (metadata.dueDate) extraInfo.push(`due:${metadata.dueDate}`);
+            if (metadata.test) extraInfo.push(`test:${metadata.test}`);
+            if (metadata.testCycle) extraInfo.push(`cycle:${metadata.testCycle}`);
+            if (extraInfo.length > 0) {
+              processed.extra = extraInfo.join('|');
               count++;
             }
-            
-            // Priorité 2 : type (important pour le type de paiement)
-            if (metadata.type && count < 3) {
-              processed.type = String(metadata.type);
-              count++;
-            }
-            
-            // Si on a encore de la place, on peut combiner due_date et autres infos dans une seule clé
-            if (count < 3 && (metadata.dueDate || metadata.test || metadata.testCycle)) {
-              const extraInfo = [];
-              if (metadata.dueDate) extraInfo.push(`due:${metadata.dueDate}`);
-              if (metadata.test) extraInfo.push(`test:${metadata.test}`);
-              if (metadata.testCycle) extraInfo.push(`cycle:${metadata.testCycle}`);
-              if (extraInfo.length > 0) {
-                processed.extra = extraInfo.join('|');
-                count++;
-              }
-            }
-            
-            return processed;
-          })() : {})
-        }
+          }
+
+          return processed;
+        })() : {})
+      }
     };
-    
+
     // ✅ NOUVEAU : Ajouter charge_date si fourni (format YYYY-MM-DD requis par GoCardless)
     if (paymentChargeDate) {
       paymentData.charge_date = paymentChargeDate;
@@ -2144,7 +2144,7 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
     const paymentId = response.data.payments.id;
     const paymentStatus = response.data.payments.status;
     console.log(`[GoCardless] 💳 Paiement créé: ${paymentId}, status: ${paymentStatus}`);
-    
+
     // ✅ DIAGNOSTIC : Logs pour comprendre pourquoi la sauvegarde ne se fait pas
     console.log('\n========================================');
     console.log(`[GoCardless] 🔍 DIAGNOSTIC SAUVEGARDE paymentId ${paymentId}`);
@@ -2159,7 +2159,7 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
       console.log(`[GoCardless] metadataFull:`, JSON.stringify(metadata, null, 2));
     }
     console.log('========================================\n');
-    
+
     // ✅ NOUVEAU : Sauvegarder le paymentId dans le paymentSchedule si maintenanceId est fourni
     if (!metadata?.maintenanceId) {
       console.log(`[GoCardless] ⚠️ Pas de maintenanceId dans metadata, sauvegarde annulée`);
@@ -2168,33 +2168,33 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
     if (!db) {
       console.log(`[GoCardless] ⚠️ Firebase non disponible (db est null), sauvegarde annulée`);
     }
-    
+
     if (metadata?.maintenanceId && db) {
       console.log(`[GoCardless] ✅ Conditions remplies, début sauvegarde dans schedule...`);
       try {
         const maintenanceId = metadata.maintenanceId;
         const maintenanceRef = doc(db, 'maintenances', maintenanceId);
         const maintenanceDoc = await getDoc(maintenanceRef);
-        
+
         if (maintenanceDoc.exists()) {
           const maintenance = maintenanceDoc.data();
           const paymentSchedule = maintenance.paymentSchedule || [];
-          
+
           console.log(`[GoCardless] 📅 Tentative sauvegarde paymentId ${paymentId} dans schedule (${paymentSchedule.length} items)`);
           console.log(`[GoCardless] 📅 Date de charge: ${paymentChargeDate}`);
-          
+
           let foundMatch = false;
           let scheduleUpdated = false;
-          
+
           // Mettre à jour le schedule avec le paymentId
           console.log(`[GoCardless] 🔍 Recherche dans ${paymentSchedule.length} items du schedule...`);
           const updatedSchedule = paymentSchedule.map((item, index) => {
             // Chercher par dueDate (si fourni dans metadata) ou par charge_date
             const itemDueDate = item.dueDate ? item.dueDate.substring(0, 10) : null;
             const chargeDateStr = paymentChargeDate ? paymentChargeDate.substring(0, 10) : null;
-            
+
             console.log(`[GoCardless]   Item[${index}]: dueDate=${itemDueDate}, chargeDate=${chargeDateStr}, status=${item.status}, paymentId=${item.gocardlessPaymentId || 'N/A'}`);
-            
+
             // ✅ AMÉLIORATION : Chercher aussi les items "pending" ou "processing" sans paymentId
             if (chargeDateStr && itemDueDate === chargeDateStr) {
               foundMatch = true;
@@ -2207,22 +2207,22 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
                 updatedAt: new Date().toISOString()
               };
             }
-            
+
             // ✅ NOUVEAU : Si l'item est "pending" ou "processing" sans paymentId, et que la date est proche (même mois)
             if (!item.gocardlessPaymentId && (item.status === 'pending' || item.status === 'processing')) {
               const itemDueDate = item.dueDate ? item.dueDate.substring(0, 10) : null;
               const chargeDateStr = paymentChargeDate ? paymentChargeDate.substring(0, 10) : null;
-              
+
               if (itemDueDate && chargeDateStr) {
                 // Comparer année-mois (tolérance pour les dates proches)
                 const itemYearMonth = itemDueDate.substring(0, 7);
                 const chargeYearMonth = chargeDateStr.substring(0, 7);
-                
+
                 if (itemYearMonth === chargeYearMonth) {
                   const itemDay = parseInt(itemDueDate.substring(8, 10));
                   const chargeDay = parseInt(chargeDateStr.substring(8, 10));
                   const dayDiff = Math.abs(itemDay - chargeDay);
-                  
+
                   // Si la différence est de 7 jours ou moins, considérer comme match
                   if (dayDiff <= 7) {
                     foundMatch = true;
@@ -2238,10 +2238,10 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
                 }
               }
             }
-            
+
             return item;
           });
-          
+
           // Si aucun item trouvé, ajouter un nouveau (seulement si dueDate est fourni)
           if (paymentChargeDate && !foundMatch) {
             console.log(`[GoCardless] ⚠️ Aucun item trouvé dans schedule, ajout d'un nouveau pour ${paymentChargeDate}`);
@@ -2257,7 +2257,7 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
             updatedSchedule.push(newPayment);
             scheduleUpdated = true;
           }
-          
+
           // Sauvegarder si on a trouvé ou ajouté un item
           if (scheduleUpdated) {
             await updateDoc(maintenanceRef, {
@@ -2302,7 +2302,7 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
       }
       console.error('\n========================================\n');
     }
-    
+
     console.error('[GoCardless] Erreur création paiement API:', {
       message: error.message,
       status: error.response?.status,
@@ -2311,7 +2311,7 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
       url: error.config?.url,
       requestData: error.config?.data
     });
-    
+
     res.status(error.response?.status || 500).json({
       error: 'Erreur lors de la création du paiement GoCardless',
       details: error.response?.data || error.message,
@@ -2327,9 +2327,9 @@ app.post('/api/gocardless/create-payment', async (req, res) => {
 app.get('/api/gocardless/payment-status/:paymentId', async (req, res) => {
   try {
     const { paymentId } = req.params;
-    
+
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant'
       });
     }
@@ -2344,7 +2344,7 @@ app.get('/api/gocardless/payment-status/:paymentId', async (req, res) => {
     });
 
     const payment = response.data.payments;
-    
+
     res.json({
       paymentId: payment.id,
       status: payment.status,
@@ -2369,9 +2369,9 @@ app.get('/api/gocardless/payment-status/:paymentId', async (req, res) => {
 app.get('/mandates/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
+
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant'
       });
     }
@@ -2400,7 +2400,7 @@ app.get('/mandates/:id', async (req, res) => {
 app.get('/payments', async (req, res) => {
   try {
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant'
       });
     }
@@ -2430,15 +2430,15 @@ app.get('/payments', async (req, res) => {
 app.post('/api/gocardless/sync-all-payments', async (req, res) => {
   try {
     console.log('[GoCardless] Début synchronisation manuelle de tous les paiements...');
-    
+
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant'
       });
     }
 
     const apiUrl = getGoCardlessApiUrl();
-    
+
     // Récupérer tous les paiements depuis GoCardless
     const response = await axios.get(`${apiUrl}/payments?limit=500`, {
       headers: {
@@ -2480,7 +2480,7 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
         // Extraire le numéro de contrat depuis la description
         const description = payment.description || '';
         const contractMatch = description.match(/CONTRACT-([A-Z0-9]+)/);
-        
+
         if (!contractMatch) {
           console.log(`[GoCardless] Pas de numéro de contrat trouvé dans: ${description}`);
           notFoundCount++;
@@ -2489,13 +2489,13 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
 
         const contractNumber = contractMatch[0]; // CONTRACT-XXXXX
         console.log(`[GoCardless] Recherche maintenance pour contrat: ${contractNumber}`);
-        
+
         // ✅ NOUVEAU : Filtrer côté serveur au lieu d'utiliser une requête Firestore
         const matchingMaintenances = allMaintenances.filter(m => {
           const mContractNumber = m.contractNumber || '';
           return mContractNumber === contractNumber || mContractNumber.includes(contractNumber.replace('CONTRACT-', ''));
         });
-        
+
         if (matchingMaintenances.length === 0) {
           console.log(`[GoCardless] Aucune maintenance trouvée pour le contrat: ${contractNumber}`);
           // ✅ NOUVEAU : Essayer aussi de chercher par goCardlessPaymentId
@@ -2523,7 +2523,7 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
         };
 
         const mappedStatus = statusMapping[payment.status] || payment.status;
-        
+
         // Mapper le statut GoCardless vers le statut du paymentSchedule
         const scheduleStatusMapping = {
           'paid_out': 'paid',           // Versé → Payé
@@ -2534,24 +2534,24 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
           'submitted': 'processing',    // Soumis → En cours
           'pending_submission': 'pending' // En attente → En attente
         };
-        
+
         const scheduleStatus = scheduleStatusMapping[mappedStatus] || 'pending';
-        
+
         // Mettre à jour toutes les maintenances avec ce numéro de contrat
         for (const maintenance of matchingMaintenances) {
           const maintenanceId = maintenance.id;
-          
+
           // Vérifier si le statut doit être mis à jour
           const currentStatus = maintenance.paymentStatus || 'pending';
-          
+
           // ✅ NOUVEAU : Mettre à jour aussi le paymentSchedule
           const paymentSchedule = maintenance.paymentSchedule || [];
           let scheduleUpdated = false;
-          
+
           const updatedSchedule = paymentSchedule.map(item => {
             // Chercher par paymentId (priorité)
             const matchesPaymentId = item.gocardlessPaymentId === payment.id;
-            
+
             // Chercher par date de charge (format YYYY-MM-DD)
             let matchesChargeDate = false;
             if (payment.charge_date && item.dueDate) {
@@ -2559,16 +2559,16 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
               const chargeDateStr = payment.charge_date.substring(0, 10); // YYYY-MM-DD
               const dueDateStr = item.dueDate.substring(0, 10); // YYYY-MM-DD
               matchesChargeDate = chargeDateStr === dueDateStr;
-              
+
               // Si pas de correspondance exacte, comparer année-mois (pour les cas où la date diffère de quelques jours)
               if (!matchesChargeDate) {
                 const chargeYearMonth = payment.charge_date.substring(0, 7); // YYYY-MM
                 const dueYearMonth = item.dueDate.substring(0, 7); // YYYY-MM
-                matchesChargeDate = chargeYearMonth === dueYearMonth && 
-                                   Math.abs(new Date(payment.charge_date).getDate() - new Date(item.dueDate).getDate()) <= 7;
+                matchesChargeDate = chargeYearMonth === dueYearMonth &&
+                  Math.abs(new Date(payment.charge_date).getDate() - new Date(item.dueDate).getDate()) <= 7;
               }
             }
-            
+
             if (matchesPaymentId || matchesChargeDate) {
               scheduleUpdated = true;
               return {
@@ -2582,10 +2582,10 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
             }
             return item;
           });
-          
+
           // Utiliser updatedSchedule (le nettoyage final sera fait après la boucle)
           const scheduleToUpdate = scheduleUpdated ? updatedSchedule : paymentSchedule;
-          
+
           // Mettre à jour seulement si le statut a changé ou si le paymentId n'est pas enregistré
           if (currentStatus !== mappedStatus || maintenance.goCardlessPaymentId !== payment.id || scheduleUpdated) {
             const updateData = {
@@ -2601,14 +2601,14 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
             };
 
             await updateDoc(doc(db, 'maintenances', maintenanceId), updateData);
-            
+
             console.log(`[GoCardless] ✅ Maintenance ${maintenanceId} (${maintenance.clientName}) mise à jour: ${currentStatus} → ${mappedStatus}${scheduleUpdated ? ' (paymentSchedule mis à jour)' : ''}`);
             updatedCount++;
           } else {
             console.log(`[GoCardless] ⏭️ Maintenance ${maintenanceId} déjà à jour: ${mappedStatus}`);
           }
         }
-        
+
       } catch (error) {
         console.error(`[GoCardless] Erreur traitement paiement ${payment.id}:`, error);
         errorCount++;
@@ -2619,11 +2619,11 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
     console.log('[GoCardless] Nettoyage des statuts "processing" orphelins...');
     let cleanedCount = 0;
     const allPaymentIds = new Set(payments.map(p => p.id));
-    
+
     for (const maintenance of allMaintenances) {
       const paymentSchedule = maintenance.paymentSchedule || [];
       let needsUpdate = false;
-      
+
       const cleanedSchedule = paymentSchedule.map(item => {
         // Si un item est "processing" mais n'a pas de paymentId valide dans GoCardless
         if (item.status === 'processing' && item.gocardlessPaymentId) {
@@ -2655,7 +2655,7 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
         }
         return item;
       });
-      
+
       if (needsUpdate) {
         try {
           await updateDoc(doc(db, 'maintenances', maintenance.id), {
@@ -2669,7 +2669,7 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
         }
       }
     }
-    
+
     console.log(`[GoCardless] ✅ Synchronisation terminée: ${updatedCount} mis à jour, ${notFoundCount} non trouvés, ${errorCount} erreurs, ${cleanedCount} schedules nettoyés`);
 
     res.json({
@@ -2697,9 +2697,9 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
 app.get('/payments/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
+
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant'
       });
     }
@@ -2728,9 +2728,9 @@ app.get('/payments/:id', async (req, res) => {
 app.post('/payments/:id/cancel', async (req, res) => {
   try {
     const { id } = req.params;
-    
+
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant'
       });
     }
@@ -2762,13 +2762,13 @@ app.post('/create-subscription', async (req, res) => {
     const { amount, currency, mandate_id, interval_unit, interval, description, metadata } = req.body;
 
     if (!amount || !currency || !mandate_id || !interval_unit || !interval) {
-      return res.status(400).json({ 
-        error: 'amount, currency, mandate_id, interval_unit et interval sont requis' 
+      return res.status(400).json({
+        error: 'amount, currency, mandate_id, interval_unit et interval sont requis'
       });
     }
 
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'GOCARDLESS_ACCESS_TOKEN manquant'
       });
     }
@@ -2815,14 +2815,14 @@ app.post('/create-subscription', async (req, res) => {
 app.post('/api/yousign/webhook', express.json(), async (req, res) => {
   try {
     console.log('[Yousign][Webhook] Notification reçue:', req.body);
-    
+
     const { event, signature_request } = req.body;
-    
+
     if (event === 'signature_request.completed' || event === 'signature_request.expired') {
       // Mettre à jour le statut dans Firestore
       // Note: Vous devrez implémenter la logique pour trouver la maintenance correspondante
       console.log('[Yousign][Webhook] Demande de signature mise à jour:', signature_request.id);
-      
+
       // Exemple de mise à jour (à adapter selon votre structure)
       // const maintenanceRef = doc(db, 'maintenances', maintenanceId);
       // await updateDoc(maintenanceRef, {
@@ -2830,7 +2830,7 @@ app.post('/api/yousign/webhook', express.json(), async (req, res) => {
       //   updatedAt: new Date()
       // });
     }
-    
+
     res.status(200).json({ received: true });
   } catch (error) {
     console.error('[Yousign][Webhook] Erreur:', error);
@@ -2842,13 +2842,13 @@ app.post('/api/yousign/webhook', express.json(), async (req, res) => {
 app.post('/api/gocardless/webhook', express.json(), async (req, res) => {
   try {
     console.log('[GoCardless][Webhook] Notification reçue:', req.body);
-    
+
     const { events } = req.body;
-    
+
     if (events && Array.isArray(events)) {
       for (const event of events) {
         console.log('[GoCardless][Webhook] Traitement événement:', event.resource_type, event.action);
-        
+
         switch (event.resource_type) {
           case 'mandates':
             await handleMandateEvent(event);
@@ -2864,7 +2864,7 @@ app.post('/api/gocardless/webhook', express.json(), async (req, res) => {
         }
       }
     }
-    
+
     res.status(200).json({ received: true });
   } catch (error) {
     console.error('[GoCardless][Webhook] Erreur:', error);
@@ -2875,7 +2875,7 @@ app.post('/api/gocardless/webhook', express.json(), async (req, res) => {
 // Fonctions de gestion des événements GoCardless (AMÉLIORÉES)
 async function handleMandateEvent(event) {
   const { action, links } = event;
-  
+
   switch (action) {
     case 'created':
       console.log('[GoCardless] Mandat créé:', links.mandate);
@@ -2900,32 +2900,32 @@ async function handleMandateEvent(event) {
 
 async function handlePaymentEvent(event) {
   const { action, links } = event;
-  
+
   // ✅ CORRECTION : Utiliser processGoCardlessPaymentEvent qui met à jour le paymentSchedule
   // Cette fonction cherche dans le paymentSchedule et met à jour correctement
   const success = await processGoCardlessPaymentEvent(event);
-  
+
   if (success) {
     console.log('[GoCardless] Événement paiement traité avec succès:', action, links.payment);
-    
+
     // Pour les actions spécifiques, appeler aussi les handlers additionnels
-  switch (action) {
-    case 'confirmed':
+    switch (action) {
+      case 'confirmed':
         // ✅ NOUVEAU : Déclencher automatiquement le prochain paiement après mise à jour du schedule
-      await handlePaymentConfirmed(links.payment);
-      break;
+        await handlePaymentConfirmed(links.payment);
+        break;
       case 'created':
         await handlePaymentCreated(links.payment);
         break;
-    case 'failed':
-      await handlePaymentFailed(links.payment);
-      break;
-    case 'cancelled':
-      await handlePaymentCancelled(links.payment);
-      break;
-    case 'submitted':
-      await handlePaymentSubmitted(links.payment);
-      break;
+      case 'failed':
+        await handlePaymentFailed(links.payment);
+        break;
+      case 'cancelled':
+        await handlePaymentCancelled(links.payment);
+        break;
+      case 'submitted':
+        await handlePaymentSubmitted(links.payment);
+        break;
     }
   } else {
     console.log('[GoCardless] Événement paiement non traité:', action, links.payment);
@@ -2934,7 +2934,7 @@ async function handlePaymentEvent(event) {
 
 async function handleSubscriptionEvent(event) {
   const { action, links } = event;
-  
+
   switch (action) {
     case 'created':
       console.log('[GoCardless] Abonnement créé:', links.subscription);
@@ -2958,7 +2958,7 @@ async function handleSubscriptionEvent(event) {
 async function triggerFirstPayment(mandateId) {
   try {
     console.log(`[GoCardless] Déclenchement du premier paiement pour le mandat: ${mandateId}`);
-    
+
     // Récupérer les informations du mandat
     const mandateResponse = await axios.get(`${getGoCardlessApiUrl()}/mandates/${mandateId}`, {
       headers: {
@@ -2967,20 +2967,20 @@ async function triggerFirstPayment(mandateId) {
         'Content-Type': 'application/json'
       }
     });
-    
+
     const mandate = mandateResponse.data.mandates;
     const metadata = mandate.metadata || {};
     const maintenanceId = metadata.maintenanceId;
-    
+
     if (!maintenanceId) {
       console.log(`[GoCardless] Pas de maintenanceId dans les métadonnées du mandat: ${mandateId}`);
       return;
     }
-    
+
     // Récupérer les informations de maintenance depuis Firebase
     // (Cette partie sera gérée par le frontend via le scheduler)
     console.log(`[GoCardless] Premier paiement déclenché pour la maintenance: ${maintenanceId}`);
-    
+
   } catch (error) {
     console.error(`[GoCardless] Erreur lors du déclenchement du premier paiement:`, error);
   }
@@ -2992,7 +2992,7 @@ async function triggerFirstPayment(mandateId) {
 async function handlePaymentConfirmed(paymentId) {
   try {
     console.log(`[GoCardless] Gestion de la confirmation du paiement: ${paymentId}`);
-    
+
     // Récupérer les informations du paiement
     const paymentResponse = await axios.get(`${getGoCardlessApiUrl()}/payments/${paymentId}`, {
       headers: {
@@ -3001,14 +3001,14 @@ async function handlePaymentConfirmed(paymentId) {
         'Content-Type': 'application/json'
       }
     });
-    
+
     const payment = paymentResponse.data.payments;
     const metadata = payment.metadata || {};
-    
+
     // ✅ CORRECTION : Chercher maintenance_id (snake_case) au lieu de maintenanceId (camelCase)
     // GoCardless normalise les métadonnées en snake_case
     let maintenanceId = metadata.maintenance_id || metadata.maintenanceId;
-    
+
     // Si pas trouvé, chercher dans la clé "extra" (format: "due:2025-11-20|test:true|cycle:123")
     if (!maintenanceId && metadata.extra) {
       const extraMatch = metadata.extra.match(/maintenance[_:]([^|]+)/i);
@@ -3016,7 +3016,7 @@ async function handlePaymentConfirmed(paymentId) {
         maintenanceId = extraMatch[1];
       }
     }
-    
+
     // Si toujours pas trouvé, essayer de trouver via le paymentId dans Firebase
     if (!maintenanceId) {
       console.log(`[GoCardless] Pas de maintenance_id dans les métadonnées, recherche via paymentId: ${paymentId}`);
@@ -3026,16 +3026,16 @@ async function handlePaymentConfirmed(paymentId) {
         console.log(`[GoCardless] Maintenance trouvée via paymentId: ${maintenanceId}`);
       }
     }
-    
+
     if (!maintenanceId) {
       console.log(`[GoCardless] Pas de maintenanceId trouvé pour le paiement: ${paymentId}`);
       console.log(`[GoCardless] Métadonnées disponibles:`, JSON.stringify(metadata, null, 2));
       return;
     }
-    
+
     // ✅ NOUVEAU : Notifier le frontend pour créer automatiquement le prochain paiement
     await notifyFrontendPaymentConfirmed(maintenanceId, paymentId, payment);
-    
+
   } catch (error) {
     console.error(`[GoCardless] Erreur lors de la gestion de la confirmation:`, error);
   }
@@ -3047,7 +3047,7 @@ async function handlePaymentConfirmed(paymentId) {
 async function handlePaymentFailed(paymentId) {
   try {
     console.log(`[GoCardless] Gestion de l'échec du paiement: ${paymentId}`);
-    
+
     const paymentResponse = await axios.get(`${getGoCardlessApiUrl()}/payments/${paymentId}`, {
       headers: {
         'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
@@ -3055,16 +3055,16 @@ async function handlePaymentFailed(paymentId) {
         'Content-Type': 'application/json'
       }
     });
-    
+
     const payment = paymentResponse.data.payments;
     const metadata = payment.metadata || {};
     const maintenanceId = metadata.maintenanceId;
-    
+
     if (maintenanceId) {
       // ✅ NOUVEAU : Notifier le frontend de l'échec
       await notifyFrontendPaymentFailed(maintenanceId, paymentId, payment);
     }
-    
+
   } catch (error) {
     console.error(`[GoCardless] Erreur lors de la gestion de l'échec:`, error);
   }
@@ -3076,7 +3076,7 @@ async function handlePaymentFailed(paymentId) {
 async function handlePaymentSubmitted(paymentId) {
   try {
     console.log(`[GoCardless] Gestion de la soumission du paiement: ${paymentId}`);
-    
+
     const paymentResponse = await axios.get(`${getGoCardlessApiUrl()}/payments/${paymentId}`, {
       headers: {
         'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
@@ -3084,16 +3084,16 @@ async function handlePaymentSubmitted(paymentId) {
         'Content-Type': 'application/json'
       }
     });
-    
+
     const payment = paymentResponse.data.payments;
     const metadata = payment.metadata || {};
     const maintenanceId = metadata.maintenanceId;
-    
+
     if (maintenanceId) {
       // ✅ NOUVEAU : Notifier le frontend de la soumission
       await notifyFrontendPaymentSubmitted(maintenanceId, paymentId, payment);
     }
-    
+
   } catch (error) {
     console.error(`[GoCardless] Erreur lors de la gestion de la soumission:`, error);
   }
@@ -3105,7 +3105,7 @@ async function handlePaymentSubmitted(paymentId) {
 async function handlePaymentCreated(paymentId) {
   try {
     console.log(`[GoCardless] Gestion de la création du paiement: ${paymentId}`);
-    
+
     const paymentResponse = await axios.get(`${getGoCardlessApiUrl()}/payments/${paymentId}`, {
       headers: {
         'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
@@ -3113,16 +3113,16 @@ async function handlePaymentCreated(paymentId) {
         'Content-Type': 'application/json'
       }
     });
-    
+
     const payment = paymentResponse.data.payments;
     const metadata = payment.metadata || {};
     const maintenanceId = metadata.maintenanceId;
-    
+
     if (maintenanceId) {
       // ✅ NOUVEAU : Notifier le frontend de la création
       await notifyFrontendPaymentCreated(maintenanceId, paymentId, payment);
     }
-    
+
   } catch (error) {
     console.error(`[GoCardless] Erreur lors de la gestion de la création:`, error);
   }
@@ -3134,7 +3134,7 @@ async function handlePaymentCreated(paymentId) {
 async function handlePaymentCancelled(paymentId) {
   try {
     console.log(`[GoCardless] Gestion de l'annulation du paiement: ${paymentId}`);
-    
+
     const paymentResponse = await axios.get(`${getGoCardlessApiUrl()}/payments/${paymentId}`, {
       headers: {
         'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
@@ -3142,16 +3142,16 @@ async function handlePaymentCancelled(paymentId) {
         'Content-Type': 'application/json'
       }
     });
-    
+
     const payment = paymentResponse.data.payments;
     const metadata = payment.metadata || {};
     const maintenanceId = metadata.maintenanceId;
-    
+
     if (maintenanceId) {
       // ✅ NOUVEAU : Notifier le frontend de l'annulation
       await notifyFrontendPaymentCancelled(maintenanceId, paymentId, payment);
     }
-    
+
   } catch (error) {
     console.error(`[GoCardless] Erreur lors de la gestion de l'annulation:`, error);
   }
@@ -3163,10 +3163,10 @@ async function handlePaymentCancelled(paymentId) {
 async function handleMandateCancellation(mandateId) {
   try {
     console.log(`[GoCardless] Gestion de l'annulation du mandat: ${mandateId}`);
-    
+
     // ✅ NOUVEAU : Notifier le frontend de l'annulation du mandat
     await notifyFrontendMandateCancelled(mandateId);
-    
+
   } catch (error) {
     console.error(`[GoCardless] Erreur lors de la gestion de l'annulation du mandat:`, error);
   }
@@ -3178,10 +3178,10 @@ async function handleMandateCancellation(mandateId) {
 async function handleMandateExpiration(mandateId) {
   try {
     console.log(`[GoCardless] Gestion de l'expiration du mandat: ${mandateId}`);
-    
+
     // ✅ NOUVEAU : Notifier le frontend de l'expiration du mandat
     await notifyFrontendMandateExpired(mandateId);
-    
+
   } catch (error) {
     console.error(`[GoCardless] Erreur lors de la gestion de l'expiration du mandat:`, error);
   }
@@ -3199,7 +3199,7 @@ async function notifyFrontendPaymentConfirmed(maintenanceId, paymentId, payment)
     // Si besoin, créer l'endpoint dans le frontend plus tard
     console.log(`[GoCardless] 💡 Notification frontend désactivée (endpoint non implémenté) - Firebase déjà mis à jour via webhook`);
     return;
-    
+
     /* DÉSACTIVÉ TEMPORAIREMENT - Endpoint frontend non implémenté
     const response = await axios.post(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/api/gocardless/payment-update`, {
       maintenanceId,
@@ -3217,7 +3217,7 @@ async function notifyFrontendPaymentConfirmed(maintenanceId, paymentId, payment)
     
     console.log(`[GoCardless] Frontend notifié de la confirmation du paiement: ${paymentId}`);
     */
-    
+
   } catch (error) {
     // Erreur silencieuse - notification optionnelle
   }
@@ -3248,7 +3248,7 @@ async function notifyFrontendPaymentFailed(maintenanceId, paymentId, payment) {
     
     console.log(`[GoCardless] Frontend notifié de l'échec du paiement: ${paymentId}`);
     */
-    
+
   } catch (error) {
     // Erreur silencieuse - notification optionnelle
   }
@@ -3279,7 +3279,7 @@ async function notifyFrontendPaymentSubmitted(maintenanceId, paymentId, payment)
     
     console.log(`[GoCardless] Frontend notifié de la soumission du paiement: ${paymentId}`);
     */
-    
+
   } catch (error) {
     // Erreur silencieuse - notification optionnelle
   }
@@ -3310,7 +3310,7 @@ async function notifyFrontendPaymentCreated(maintenanceId, paymentId, payment) {
     
     console.log(`[GoCardless] Frontend notifié de la création du paiement: ${paymentId}`);
     */
-    
+
   } catch (error) {
     // Erreur silencieuse - notification optionnelle
   }
@@ -3341,7 +3341,7 @@ async function notifyFrontendPaymentCancelled(maintenanceId, paymentId, payment)
     
     console.log(`[GoCardless] Frontend notifié de l'annulation du paiement: ${paymentId}`);
     */
-    
+
   } catch (error) {
     // Erreur silencieuse - notification optionnelle
   }
@@ -3356,9 +3356,9 @@ async function notifyFrontendMandateCancelled(mandateId) {
       mandateId,
       status: 'cancelled'
     });
-    
+
     console.log(`[GoCardless] Frontend notifié de l'annulation du mandat: ${mandateId}`);
-    
+
   } catch (error) {
     console.error(`[GoCardless] Erreur lors de la notification du frontend:`, error);
   }
@@ -3373,9 +3373,9 @@ async function notifyFrontendMandateExpired(mandateId) {
       mandateId,
       status: 'expired'
     });
-    
+
     console.log(`[GoCardless] Frontend notifié de l'expiration du mandat: ${mandateId}`);
-    
+
   } catch (error) {
     console.error(`[GoCardless] Erreur lors de la notification du frontend:`, error);
   }
@@ -3394,7 +3394,7 @@ app.get('/api/yousign/status/:requestId', async (req, res) => {
 
     if (!process.env.YOUSIGN_API_KEY) {
       console.log('[Yousign] ERREUR: YOUSIGN_API_KEY manquante');
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'YOUSIGN_API_KEY manquant'
       });
     }
@@ -3404,7 +3404,7 @@ app.get('/api/yousign/status/:requestId', async (req, res) => {
     // Utiliser YOUSIGN_API_URL normalisé (déjà avec /v3) et signature_requests avec underscore
     const apiUrl = `${YOUSIGN_API_URL}/signature_requests/${requestId}`;
     console.log('[Yousign] URL appelée:', apiUrl);
-    
+
     const response = await axios.get(apiUrl, {
       headers: {
         'Authorization': `Bearer ${process.env.YOUSIGN_API_KEY}`,
@@ -3439,11 +3439,11 @@ app.get('/api/yousign/status/:requestId', async (req, res) => {
 
   } catch (error) {
     console.error('[Yousign] Erreur lors de la récupération du statut:', error.response?.data || error.message);
-    
+
     if (error.response?.status === 404) {
       return res.status(404).json({ error: 'Demande de signature non trouvée' });
     }
-    
+
     res.status(500).json({
       error: 'Erreur lors de la récupération du statut de signature',
       details: error.response?.data || error.message
@@ -3456,7 +3456,7 @@ app.get('/api/maintenance/:id', async (req, res) => {
   try {
     const { id } = req.params;
     console.log('[Maintenance] Récupération de la maintenance:', id);
-    
+
     // ✅ Vérifier que Firebase est initialisé
     if (!db) {
       return res.status(503).json({
@@ -3465,23 +3465,23 @@ app.get('/api/maintenance/:id', async (req, res) => {
         details: 'Vérifiez votre fichier .env dans gocardless-backend/'
       });
     }
-    
+
     try {
       const maintenanceRef = doc(db, 'maintenances', id);
       const maintenanceDoc = await getDoc(maintenanceRef);
-      
+
       if (!maintenanceDoc.exists()) {
         return res.status(404).json({
           error: 'Maintenance non trouvée',
           id
         });
       }
-      
+
       const maintenance = {
         id: maintenanceDoc.id,
         ...maintenanceDoc.data()
       };
-      
+
       console.log(`[Maintenance] Maintenance trouvée: ${maintenance.contractNumber || id}`);
       res.json(maintenance);
     } catch (firebaseError) {
@@ -3497,7 +3497,7 @@ app.get('/api/maintenance/:id', async (req, res) => {
       }
       throw firebaseError; // Relancer les autres erreurs
     }
-    
+
   } catch (error) {
     console.error('[Maintenance] Erreur récupération maintenance:', error);
     res.status(500).json({
@@ -3517,7 +3517,7 @@ app.get('/api/maintenance/pending-signatures', async (req, res) => {
     // pour éviter les erreurs Firestore avec les requêtes complexes
     const maintenancesRef = collection(db, 'maintenances');
     const snapshot = await getDocs(maintenancesRef);
-    
+
     const allMaintenances = snapshot.docs.map(doc => ({
       id: doc.id,
       ...doc.data()
@@ -3550,7 +3550,7 @@ app.get('/maintenance/pending-signatures', async (req, res) => {
 
     const maintenancesRef = collection(db, 'maintenances');
     const snapshot = await getDocs(maintenancesRef);
-    
+
     const allMaintenances = snapshot.docs.map(doc => ({
       id: doc.id,
       ...doc.data()
@@ -3602,8 +3602,8 @@ app.patch('/api/maintenance/:id/signature', async (req, res) => {
 
     console.log(`[Maintenance] Maintenance ${id} mise à jour avec succès`);
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: 'Statut de signature mis à jour',
       data: updateData
     });
@@ -3630,7 +3630,7 @@ app.get('/api/yousign/download/:requestId', async (req, res) => {
 
     if (!process.env.YOUSIGN_API_KEY) {
       console.log('[Yousign] ERREUR: YOUSIGN_API_KEY manquante (download)');
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: 'YOUSIGN_API_KEY manquant'
       });
     }
@@ -3640,7 +3640,7 @@ app.get('/api/yousign/download/:requestId', async (req, res) => {
     // Utiliser YOUSIGN_API_URL normalisé (déjà avec /v3) et signature_requests avec underscore
     const documentsUrl = `${YOUSIGN_API_URL}/signature_requests/${requestId}/documents`;
     console.log('[Yousign] URL documents appelée:', documentsUrl);
-    
+
     const response = await axios.get(documentsUrl, {
       headers: {
         'Authorization': `Bearer ${process.env.YOUSIGN_API_KEY}`,
@@ -3654,7 +3654,7 @@ app.get('/api/yousign/download/:requestId', async (req, res) => {
 
     // Récupérer le premier document (normalement il n'y en a qu'un)
     const document = response.data[0];
-    
+
     // Télécharger le fichier signé - utiliser la structure correcte de l'API YouSign
     const downloadUrl = `${YOUSIGN_API_URL}/signature_requests/${requestId}/documents/${document.id}/download`;
     console.log('[Yousign] URL download appelée:', downloadUrl);
@@ -3668,17 +3668,17 @@ app.get('/api/yousign/download/:requestId', async (req, res) => {
     // Configurer les headers pour le téléchargement
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="Contrat_Signe_${requestId}.pdf"`);
-    
+
     // Streamer le fichier vers la réponse
     fileResponse.data.pipe(res);
 
   } catch (error) {
     console.error('[Yousign] Erreur lors du téléchargement:', error.response?.data || error.message);
-    
+
     if (error.response?.status === 404) {
       return res.status(404).json({ error: 'Document signé non trouvé' });
     }
-    
+
     res.status(500).json({
       error: 'Erreur lors du téléchargement du contrat signé',
       details: error.response?.data || error.message
@@ -3828,7 +3828,7 @@ app.post('/api/sumup/test-token', async (req, res) => {
   try {
     console.log('[SumUp] Test d\'obtention du token OAuth2');
     const token = await sumupService.getAccessToken();
-    
+
     res.json({
       success: true,
       message: 'Token obtenu avec succès',
@@ -3855,27 +3855,27 @@ app.listen(PORT, () => {
 app.post('/webhooks/gocardless', async (req, res) => {
   try {
     console.log('[Webhook] Réception webhook GoCardless');
-    
+
     // Validation de la signature du webhook
     const signature = req.headers['webhook-signature'];
     const payload = JSON.stringify(req.body);
-    
+
     if (!validateGoCardlessWebhook(payload, signature)) {
       console.error('[Webhook] Signature invalide, webhook rejeté');
       return res.status(401).json({ error: 'Signature invalide' });
     }
-    
+
     const { events } = req.body;
     console.log('[Webhook] Événements reçus:', events?.length || 0);
-    
+
     if (!events || !Array.isArray(events)) {
       console.log('[Webhook] Aucun événement reçu');
       return res.status(200).json({ message: 'Aucun événement à traiter' });
     }
-    
+
     let processedCount = 0;
     let errorCount = 0;
-    
+
     // Traiter chaque événement
     for (const event of events) {
       try {
@@ -3890,20 +3890,20 @@ app.post('/webhooks/gocardless', async (req, res) => {
         errorCount++;
       }
     }
-    
+
     console.log('[Webhook] Traitement terminé:', { processed: processedCount, errors: errorCount });
-    
-    res.status(200).json({ 
+
+    res.status(200).json({
       message: 'Webhook traité avec succès',
       processed: processedCount,
       errors: errorCount
     });
-    
+
   } catch (error) {
     console.error('[Webhook] Erreur générale webhook:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Erreur interne du serveur',
-      details: error.message 
+      details: error.message
     });
   }
 });
@@ -3912,7 +3912,7 @@ app.post('/webhooks/gocardless', async (req, res) => {
 app.get('/webhooks/gocardless/test', async (req, res) => {
   try {
     console.log('[Webhook] Test du webhook GoCardless');
-    
+
     // Simuler un événement de test
     const testEvent = {
       id: 'test_event_' + Date.now(),
@@ -3923,16 +3923,16 @@ app.get('/webhooks/gocardless/test', async (req, res) => {
       },
       created_at: new Date().toISOString()
     };
-    
+
     const success = await processGoCardlessPaymentEvent(testEvent);
-    
+
     res.json({
       message: 'Test webhook terminé',
       success: success,
       testEvent: testEvent,
       timestamp: new Date().toISOString()
     });
-    
+
   } catch (error) {
     console.error('[Webhook] Erreur test webhook:', error);
     res.status(500).json({
@@ -3946,14 +3946,14 @@ app.get('/webhooks/gocardless/test', async (req, res) => {
 app.post('/api/gocardless/webhooks/setup', async (req, res) => {
   try {
     console.log('[Webhook] Configuration des webhooks GoCardless');
-    
+
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
       return res.status(400).json({ error: 'GOCARDLESS_ACCESS_TOKEN manquant' });
     }
-    
+
     const webhookUrl = `${req.protocol}://${req.get('host')}/webhooks/gocardless`;
     console.log('[Webhook] URL webhook:', webhookUrl);
-    
+
     // Créer le webhook via l'API GoCardless
     const response = await axios.post(
       `${getGoCardlessApiUrl()}/webhooks`,
@@ -3977,16 +3977,16 @@ app.post('/api/gocardless/webhooks/setup', async (req, res) => {
         }
       }
     );
-    
+
     console.log('[Webhook] Webhook créé avec succès:', response.data);
-    
+
     res.json({
       success: true,
       message: 'Webhook GoCardless configuré avec succès',
       webhook: response.data,
       webhookUrl: webhookUrl
     });
-    
+
   } catch (error) {
     console.error('[Webhook] Erreur configuration webhook:', error.response?.data || error.message);
     res.status(500).json({
@@ -4000,11 +4000,11 @@ app.post('/api/gocardless/webhooks/setup', async (req, res) => {
 app.get('/api/gocardless/webhooks/status', async (req, res) => {
   try {
     console.log('[Webhook] Vérification statut des webhooks GoCardless');
-    
+
     if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
       return res.status(400).json({ error: 'GOCARDLESS_ACCESS_TOKEN manquant' });
     }
-    
+
     const response = await axios.get(
       `${getGoCardlessApiUrl()}/webhooks`,
       {
@@ -4014,10 +4014,10 @@ app.get('/api/gocardless/webhooks/status', async (req, res) => {
         }
       }
     );
-    
+
     const webhooks = response.data.webhooks || [];
     const activeWebhooks = webhooks.filter(w => w.status === 'active');
-    
+
     res.json({
       success: true,
       total: webhooks.length,
@@ -4030,7 +4030,7 @@ app.get('/api/gocardless/webhooks/status', async (req, res) => {
         created_at: w.created_at
       }))
     });
-    
+
   } catch (error) {
     console.error('[Webhook] Erreur vérification statut webhooks:', error.response?.data || error.message);
     res.status(500).json({
