@@ -43,6 +43,7 @@ const allowedOrigins = [
   process.env.ADMIN_URL || 'http://localhost:3000',
   'https://teal-sunflower-0ade91.netlify.app', // Frontend Netlify (ancien)
   'https://labelenergie1.netlify.app', // Frontend Netlify (nouveau)
+  'https://labelenergie234.netlify.app', // Frontend Netlify test
   'http://localhost:5173', // Fallback pour développement
   'http://localhost:3000',  // Fallback pour développement
   'http://localhost:4173'   // Fallback pour développement
