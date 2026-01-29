@@ -9,6 +9,9 @@ if (result.error) {
   console.log('🔑 Variables d\'environnement chargées:', {
     YOUSIGN_API_KEY: process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE',
     YOUSIGN_API_URL: process.env.YOUSIGN_API_URL,
+    SUMUP_CLIENT_ID: process.env.SUMUP_CLIENT_ID ? 'PRÉSENTE' : 'MANQUANTE',
+    SUMUP_CLIENT_SECRET: process.env.SUMUP_CLIENT_SECRET ? 'PRÉSENTE' : 'MANQUANTE',
+    SUMUP_MERCHANT_CODE: process.env.SUMUP_MERCHANT_CODE || 'MANQUANT',
     PORT: process.env.PORT,
     NODE_ENV: process.env.NODE_ENV
   });
@@ -23,12 +26,17 @@ const nodemailer = require('nodemailer');
 // Importer les routes de test
 const testRoutes = require('./test-endpoints');
 
+// Importer le service SumUp
+const sumupService = require('./sumup-service');
+
 // Imports Firestore pour la synchronisation YouSign
 const { initializeApp } = require('firebase/app');
 const { getFirestore, doc, updateDoc, collection, query, where, getDocs, getDoc } = require('firebase/firestore');
 
 const app = express();
-app.use(express.json());
+// Augmenter la limite de taille pour permettre l'envoi de PDF en base64 (jusqu'à 50MB)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // Configuration CORS dynamique pour production
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:5173',
@@ -764,6 +772,328 @@ app.get('/api/yousign/signature-request/:id/document', async (req, res) => {
     res.status(500).json({
       error: 'Erreur lors du téléchargement du document signé',
       details: error.response?.data || error.message
+    });
+  }
+});
+
+// POST : Endpoint pour les devis SAV (signature électronique)
+app.post('/api/yousign-devis', async (req, res) => {
+  console.log('\n🔷 ====== REQUÊTE YOUSIGN DEVIS SAV ======');
+  
+  try {
+    const { action, ...data } = req.body;
+    console.log('[Yousign-Devis] Action:', action);
+
+    switch (action) {
+      case 'create_signature_request': {
+        const { pdfBase64, filename, signer, devisInfo } = data;
+        console.log('[Yousign-Devis] Devis:', devisInfo?.number);
+        console.log('[Yousign-Devis] Signataire:', signer?.email);
+
+        // Validation des données
+        if (!pdfBase64 || !signer || !devisInfo) {
+          return res.status(400).json({
+            success: false,
+            error: 'Données manquantes: pdfBase64, signer, devisInfo requis'
+          });
+        }
+
+        // 1. Créer la signature request
+        console.log('[Yousign-Devis] Création de la demande de signature...');
+        const signatureRequestRes = await yousignApi.post('/signature_requests', {
+          name: `Devis SAV ${devisInfo.number}`,
+          delivery_mode: 'email',
+          timezone: 'Europe/Paris',
+          reminder_settings: {
+            interval_in_days: 7,
+            max_occurrences: 3
+          },
+          expiration_date: devisInfo.validUntil || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+          external_id: devisInfo.id
+        });
+        const signatureRequestId = signatureRequestRes.data.id;
+        console.log('[Yousign-Devis] Signature request créée:', signatureRequestId);
+
+        // 2. Upload du document PDF (depuis base64)
+        console.log('[Yousign-Devis] Upload du document...');
+        const pdfBuffer = Buffer.from(pdfBase64, 'base64');
+        const FormData = require('form-data');
+        const form = new FormData();
+        form.append('file', pdfBuffer, {
+          filename: filename || `devis-${devisInfo.number}.pdf`,
+          contentType: 'application/pdf'
+        });
+        form.append('nature', 'signable_document');
+        
+        const uploadRes = await axios.post(
+          `${YOUSIGN_API_URL}/signature_requests/${signatureRequestId}/documents`,
+          form,
+          { headers: { ...form.getHeaders(), Authorization: `Bearer ${YOUSIGN_API_TOKEN}` } }
+        );
+        const documentId = uploadRes.data.id;
+        console.log('[Yousign-Devis] Document uploadé:', documentId);
+
+        // 3. Ajouter le signataire
+        console.log('[Yousign-Devis] Ajout du signataire...');
+        
+        // Préparer les infos du signataire (sans téléphone si invalide)
+        const signerInfo = {
+          first_name: signer.firstName || 'Client',
+          last_name: signer.lastName || 'SAV',
+          email: signer.email,
+          locale: 'fr'
+        };
+        
+        // Ajouter le téléphone seulement s'il est valide (format international +33...)
+        if (signer.phone) {
+          // Nettoyer et formater le numéro
+          let phone = signer.phone.replace(/\s/g, '').replace(/\./g, '').replace(/-/g, '');
+          // Si le numéro commence par 0, le convertir en format international français
+          if (phone.startsWith('0')) {
+            phone = '+33' + phone.substring(1);
+          }
+          // Vérifier que le format est valide (commence par + et contient au moins 10 chiffres)
+          if (phone.startsWith('+') && phone.replace(/\D/g, '').length >= 10) {
+            signerInfo.phone_number = phone;
+            console.log('[Yousign-Devis] Téléphone formaté:', phone);
+          } else {
+            console.log('[Yousign-Devis] Téléphone ignoré (format invalide):', signer.phone);
+          }
+        }
+        
+        // Calculer les coordonnées pour positionner la signature dans la zone "Le client"
+        // Pour un PDF A4 standard : 595 points de largeur x 842 points de hauteur
+        // IMPORTANT: Les coordonnées Yousign sont depuis le HAUT de la page (y=0 en haut)
+        // La signature est maintenant positionnée EN BAS du document, juste avant le footer
+        // (après les conditions générales, avant le footer)
+        // La signature doit être SUR la ligne de signature du client, pas en dessous
+        
+        // Dimensions A4 en points (1 point = 1/72 inch)
+        const A4_WIDTH = 595;
+        const A4_HEIGHT = 842;
+        
+        // Calcul de la position de la ligne de signature
+        // Le template a maintenant :
+        // - Header avec logo: ~80-100 points
+        // - Titre devis: ~100-180 points
+        // - Section CLIENT: ~180-250 points
+        // - Prestations: ~250-400 points
+        // - Conditions générales: ~400-550 points
+        // - Section signature: ~550-700 points (environ 65-83% de la hauteur) - À LA FIN
+        // - Footer: ~700-842 points
+        
+        // Position de la zone de signature du client (section gauche)
+        // x: zone gauche du document (environ 8% de la largeur pour la colonne gauche)
+        // y: SUR la ligne de signature (border-top), positionnée en bas du document (après les conditions)
+        //    
+        // Calcul précis basé sur la structure CSS :
+        //    - Section .signatures commence vers 75-80% de la hauteur (~630-674 points)
+        //    - .signature-box : padding-top: 40px (≈ 30 points en PDF à 96 DPI)
+        //    - .signature-line : margin-top: 30px (≈ 22 points en PDF) + border-top (la ligne elle-même)
+        //    - La ligne border-top est donc à : début_signature_box + 30 + 22 = début + 52 points
+        //    - Pour un PDF A4 (842 points), section signatures à ~75% = 631 points
+        //    - Donc ligne border-top ≈ 631 + 52 = 683 points
+        //
+        // IMPORTANT: Yousign positionne Y depuis le HAUT de la zone de signature
+        // Pour que la signature soit DIRECTEMENT SUR la ligne border-top :
+        //    - Y doit être positionné à la hauteur de la ligne moins un petit offset
+        //    - Le texte de la signature Yousign apparaîtra légèrement au-dessus de la ligne si Y = ligne
+        //    - Pour que le texte soit SUR la ligne, réduire Y de 15-25 points
+        // Calcul précis basé sur la structure CSS réelle du template
+        // Section signatures commence vers 70% de la hauteur (réduit de 75% pour remonter le bloc)
+        // Pour remonter : réduire le pourcentage (ex: 0.70 au lieu de 0.75)
+        // Pour descendre : augmenter le pourcentage (ex: 0.80 au lieu de 0.75)
+        const sectionStartY = Math.round(A4_HEIGHT * 0.60); // ~589 points - début de la section signatures (remonté)
+        
+        // Conversion CSS vers points PDF (1px CSS ≈ 0.75 points PDF à 96 DPI)
+        // .signature-box : padding-top: 40px ≈ 30 points
+        const signatureBoxPadding = Math.round(40 * 0.75); // 30 points
+        
+        // .signature-line : margin-top: 30px ≈ 22 points
+        const signatureLineMargin = Math.round(30 * 0.75); // 22 points
+        
+        // Position exacte de la ligne border-top
+        const linePosition = sectionStartY + signatureBoxPadding + signatureLineMargin; // ~684 points
+        
+        // IMPORTANT: Yousign positionne le coin supérieur gauche de la zone de signature
+        // Pour que la signature soit SUR la ligne border-top, il faut :
+        // - Positionner Y légèrement au-dessus de la ligne pour que le texte soit sur la ligne
+        // - Le texte de la signature Yousign apparaît généralement 5-10 points sous le Y spécifié
+        // - Donc Y = linePosition - 25 à 30 points pour que le texte soit sur la ligne
+        // NOTE: Yousign exige une hauteur minimale de 37 points
+        const signatureHeight = 37; // Hauteur minimale requise par Yousign
+        const yOffset = 25; // Offset pour positionner le texte sur la ligne
+        
+        const signatureField = {
+          type: 'signature',
+          document_id: documentId,
+          page: 1,
+          x: Math.round(A4_WIDTH * 0.08),      // ~48 points - zone gauche (client)
+          y: linePosition - yOffset,            // ~659 points - Position pour que le texte soit SUR la ligne
+          width: Math.round(A4_WIDTH * 0.30),   // ~179 points - largeur pour la zone client
+          height: signatureHeight,               // Hauteur de la zone
+          label: 'Signature du client'           // Label descriptif
+        };
+        
+        console.log('[Yousign-Devis] Zone de signature configurée pour la zone "Le client":', {
+          ...signatureField,
+          position: `(${signatureField.x}, ${signatureField.y})`,
+          size: `${signatureField.width}x${signatureField.height}`,
+          pageDimensions: `${A4_WIDTH}x${A4_HEIGHT}`,
+          calculations: {
+            sectionStartY,
+            signatureBoxPadding,
+            signatureLineMargin,
+            linePosition,
+            yOffset,
+            finalY: signatureField.y,
+            distanceFromLine: linePosition - signatureField.y
+          },
+          note: `Signature positionnée à Y=${signatureField.y} (ligne à ${linePosition}). Le texte Yousign apparaîtra ~5-10 points sous Y, donc sur la ligne. Si besoin, ajuster yOffset (actuellement ${yOffset}).`
+        });
+        
+        const signerRes = await yousignApi.post(
+          `/signature_requests/${signatureRequestId}/signers`,
+          {
+            info: signerInfo,
+            signature_level: 'electronic_signature',
+            signature_authentication_mode: 'no_otp',
+            fields: [signatureField]
+          }
+        );
+        const signerId = signerRes.data.id;
+        const signingUrl = signerRes.data.signature_link;
+        console.log('[Yousign-Devis] Signataire ajouté:', signerId);
+
+        // 4. Activer la demande
+        console.log('[Yousign-Devis] Activation de la demande...');
+        await yousignApi.post(`/signature_requests/${signatureRequestId}/activate`);
+        console.log('[Yousign-Devis] Demande activée');
+
+        console.log('✅ [Yousign-Devis] Processus complet terminé !');
+        console.log('🔗 [Yousign-Devis] Signature URL:', signingUrl);
+
+        // NOUVEAU: Créer automatiquement un lien de paiement SumUp
+        let sumupPaymentUrl = null;
+        let sumupCheckoutId = null;
+        let sumupError = null;
+        
+        try {
+          console.log('[Yousign-Devis] Création automatique du lien de paiement SumUp...');
+          
+          // Vérifier si on a les informations nécessaires pour SumUp
+          if (signerInfo.email && data.amount) {
+            const sumupCheckoutData = {
+              devisId: data.devisId || `DEVIS-${Date.now()}`,
+              amount: parseFloat(data.amount),
+              currency: data.currency || 'EUR',
+              clientEmail: signerInfo.email,
+              description: `Paiement ${data.devisNumber || 'devis'} - ${signerInfo.first_name} ${signerInfo.last_name}`,
+              returnUrl: data.returnUrl || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/sav/payment-success`
+            };
+
+            const sumupResult = await sumupService.createCheckout(sumupCheckoutData);
+            
+            if (sumupResult.success) {
+              sumupPaymentUrl = sumupResult.payment_url;
+              sumupCheckoutId = sumupResult.checkout_id;
+              console.log('[Yousign-Devis] ✅ Lien de paiement SumUp créé:', sumupPaymentUrl);
+
+              // Sauvegarder dans Firestore si disponible
+              if (db && data.devisId) {
+                try {
+                  const maintenanceRef = doc(db, 'maintenances', data.devisId);
+                  await updateDoc(maintenanceRef, {
+                    sumup_checkout_id: sumupCheckoutId,
+                    sumup_payment_url: sumupPaymentUrl,
+                    sumup_created_at: new Date().toISOString(),
+                    sumup_status: sumupResult.status,
+                    yousign_signature_url: signingUrl,
+                    yousign_signature_request_id: signatureRequestId
+                  });
+                  console.log('[Yousign-Devis] Liens YouSign et SumUp sauvegardés dans Firestore');
+                } catch (firestoreError) {
+                  console.warn('[Yousign-Devis] Erreur Firestore:', firestoreError.message);
+                }
+              }
+            } else {
+              sumupError = sumupResult.error;
+              console.warn('[Yousign-Devis] ⚠️ Erreur création lien SumUp:', sumupResult.error);
+            }
+          } else {
+            console.log('[Yousign-Devis] ℹ️ Informations insuffisantes pour créer le lien SumUp (email ou montant manquant)');
+          }
+        } catch (sumupErr) {
+          sumupError = sumupErr.message;
+          console.error('[Yousign-Devis] ❌ Erreur lors de la création du lien SumUp:', sumupErr);
+        }
+
+        return res.json({
+          success: true,
+          signatureRequestId,
+          documentId,
+          signerId,
+          status: 'ongoing',
+          signingUrl,
+          // Ajouter les informations SumUp à la réponse
+          sumup: {
+            payment_url: sumupPaymentUrl,
+            checkout_id: sumupCheckoutId,
+            created: !!sumupPaymentUrl,
+            error: sumupError
+          }
+        });
+      }
+
+      case 'get_status': {
+        const { signatureRequestId } = data;
+        console.log('[Yousign-Devis] Vérification statut:', signatureRequestId);
+        
+        const statusRes = await yousignApi.get(`/signature_requests/${signatureRequestId}`);
+        const status = statusRes.data;
+        
+        return res.json({
+          success: true,
+          status: status.status,
+          signers: status.signers?.map(s => ({
+            email: s.info?.email,
+            status: s.status,
+            signedAt: s.signed_at
+          })),
+          signedAt: status.signed_at
+        });
+      }
+
+      case 'download_signed': {
+        const { signatureRequestId, documentId } = data;
+        console.log('[Yousign-Devis] Téléchargement document signé:', signatureRequestId);
+        
+        const docRes = await yousignApi.get(
+          `/signature_requests/${signatureRequestId}/documents/${documentId}/download`,
+          { responseType: 'arraybuffer' }
+        );
+        
+        const pdfBase64 = Buffer.from(docRes.data).toString('base64');
+        
+        return res.json({
+          success: true,
+          pdfBase64
+        });
+      }
+
+      default:
+        console.error('[Yousign-Devis] Action non reconnue:', action);
+        return res.status(400).json({
+          success: false,
+          error: `Action non reconnue: ${action}`
+        });
+    }
+  } catch (error) {
+    console.error('[Yousign-Devis] Erreur:', error.response?.data || error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.response?.data?.message || error.message,
+      details: error.response?.data
     });
   }
 });
@@ -3352,6 +3682,165 @@ app.get('/api/yousign/download/:requestId', async (req, res) => {
     res.status(500).json({
       error: 'Erreur lors du téléchargement du contrat signé',
       details: error.response?.data || error.message
+    });
+  }
+});
+
+// ============================================================================
+// ROUTES SUMUP - GESTION DES PAIEMENTS
+// ============================================================================
+
+/**
+ * POST /api/sumup/create-checkout
+ * Créer un lien de paiement SumUp
+ * Body: {
+ *   devisId: string,
+ *   devisNumber: string,
+ *   amount: number,
+ *   currency: string (optionnel, défaut: EUR),
+ *   clientName: string,
+ *   clientEmail: string,
+ *   clientPhone: string (optionnel),
+ *   description: string (optionnel),
+ *   returnUrl: string (optionnel)
+ * }
+ */
+app.post('/api/sumup/create-checkout', async (req, res) => {
+  try {
+    console.log('[SumUp] Requête de création de checkout reçue');
+    console.log('[SumUp] Body:', JSON.stringify(req.body, null, 2));
+
+    const {
+      devisId,
+      devisNumber,
+      amount,
+      currency = 'EUR',
+      clientName,
+      clientEmail,
+      clientPhone,
+      description,
+      returnUrl
+    } = req.body;
+
+    // Validation des champs requis
+    if (!devisId || !amount || !clientEmail) {
+      console.error('[SumUp] Champs manquants:', { devisId, amount, clientEmail });
+      return res.status(400).json({
+        success: false,
+        error: 'Champs requis manquants',
+        details: 'devisId, amount et clientEmail sont requis'
+      });
+    }
+
+    // Validation du montant
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Montant invalide',
+        details: 'Le montant doit être un nombre positif'
+      });
+    }
+
+    // Préparer les données du checkout
+    const checkoutData = {
+      devisId: devisId,
+      amount: parsedAmount,
+      currency: currency,
+      clientEmail: clientEmail,
+      description: description || `Paiement devis ${devisNumber || devisId} - ${clientName}`,
+      returnUrl: returnUrl || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/sav/payment-success`
+    };
+
+    console.log('[SumUp] Données du checkout préparées:', checkoutData);
+
+    // Créer le checkout via le service SumUp
+    const result = await sumupService.createCheckout(checkoutData);
+
+    // Si on a Firebase, sauvegarder le lien de paiement dans Firestore
+    if (db && result.success) {
+      try {
+        const maintenanceRef = doc(db, 'maintenances', devisId);
+        await updateDoc(maintenanceRef, {
+          sumup_checkout_id: result.checkout_id,
+          sumup_payment_url: result.payment_url,
+          sumup_created_at: new Date().toISOString(),
+          sumup_status: result.status
+        });
+        console.log('[SumUp] Lien de paiement sauvegardé dans Firestore pour:', devisId);
+      } catch (firestoreError) {
+        console.warn('[SumUp] Impossible de sauvegarder dans Firestore:', firestoreError.message);
+      }
+    }
+
+    res.json(result);
+
+  } catch (error) {
+    console.error('[SumUp] Erreur lors de la création du checkout:', error);
+    res.status(error.status || 500).json(
+      error.success === false ? error : {
+        success: false,
+        error: 'Erreur lors de la création du lien de paiement',
+        details: error.message
+      }
+    );
+  }
+});
+
+/**
+ * GET /api/sumup/checkout/:checkoutId
+ * Récupérer les informations d'un checkout
+ */
+app.get('/api/sumup/checkout/:checkoutId', async (req, res) => {
+  try {
+    const { checkoutId } = req.params;
+    console.log('[SumUp] Récupération des informations du checkout:', checkoutId);
+
+    const result = await sumupService.getCheckout(checkoutId);
+    res.json(result);
+
+  } catch (error) {
+    console.error('[SumUp] Erreur lors de la récupération du checkout:', error);
+    res.status(error.status || 500).json(
+      error.success === false ? error : {
+        success: false,
+        error: 'Erreur lors de la récupération du checkout',
+        details: error.message
+      }
+    );
+  }
+});
+
+/**
+ * GET /api/sumup/config
+ * Vérifier la configuration SumUp
+ */
+app.get('/api/sumup/config', (req, res) => {
+  const config = sumupService.checkSumUpConfig();
+  res.json(config);
+});
+
+/**
+ * POST /api/sumup/test-token
+ * Tester l'obtention du token OAuth2
+ */
+app.post('/api/sumup/test-token', async (req, res) => {
+  try {
+    console.log('[SumUp] Test d\'obtention du token OAuth2');
+    const token = await sumupService.getAccessToken();
+    
+    res.json({
+      success: true,
+      message: 'Token obtenu avec succès',
+      token_preview: token ? `${token.substring(0, 20)}...` : null,
+      token_length: token ? token.length : 0
+    });
+  } catch (error) {
+    console.error('[SumUp] Erreur test token:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Erreur lors de l\'obtention du token',
+      details: error.message
     });
   }
 });
