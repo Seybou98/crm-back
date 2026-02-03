@@ -695,48 +695,58 @@ app.post('/create-subscription', async (req, res) => {
   }
 });
 
-// POST : créer mandat + subscription en un seul appel (HYBRID - automatisation complète)
+// POST : créer mandat + subscription, ou uniquement subscription si mandate_id fourni
 app.post('/create-maintenance-subscription', async (req, res) => {
   try {
+    const existingMandateId = req.body.mandate_id || req.body.mandateId;
     console.log('[GoCardless] ========================================');
-    console.log('[GoCardless] 🚀 CRÉATION MANDAT + SUBSCRIPTION (HYBRID)');
+    console.log(existingMandateId
+      ? '[GoCardless] 🚀 CRÉATION ABONNEMENT UNIQUEMENT (mandat existant)'
+      : '[GoCardless] 🚀 CRÉATION MANDAT + SUBSCRIPTION (HYBRID)');
     console.log('[GoCardless] ========================================');
     console.log('[GoCardless] Requête reçue:', req.body);
 
     const {
-      // Mandate fields
       account_holder_name,
       iban,
-      // Subscription fields
       amount,
       currency = 'EUR',
       interval_unit = 'monthly',
       interval = 1,
       start_date,
-      // Metadata
       metadata = {}
     } = req.body;
-
-    // Validation
-    if (!account_holder_name || !iban) {
-      return res.status(400).json({ error: 'account_holder_name et iban sont requis' });
-    }
 
     if (!amount) {
       return res.status(400).json({ error: 'amount est requis' });
     }
-
     if (!process.env.GOCARDLESS_ACCESS_TOKEN || !process.env.GOCARDLESS_CREDITOR_ID) {
       return res.status(500).json({ error: 'Configuration GoCardless manquante (token ou creditor)' });
     }
 
     const apiUrl = getGoCardlessApiUrl();
-    const countryCode = getCountryCode(metadata?.country);
+    const limitedMetadata = {
+      contractNumber: metadata?.contractNumber || '',
+      maintenanceId: metadata?.maintenanceId || '',
+      clientId: metadata?.clientId || ''
+    };
+    let mandateId;
+    let customerId = null;
+    let bankAccountId = null;
+    let mandateStatus = null;
 
-    console.log('[GoCardless] 🔸 ÉTAPE 1/2: Création mandat...');
+    if (existingMandateId) {
+      mandateId = existingMandateId;
+      console.log('[GoCardless] 🔸 Utilisation du mandat existant:', mandateId);
+    } else {
+      // Validation pour création complète
+      if (!account_holder_name || !iban) {
+        return res.status(400).json({ error: 'account_holder_name et iban sont requis (ou fournir mandate_id)' });
+      }
+      const countryCode = getCountryCode(metadata?.country);
+      console.log('[GoCardless] 🔸 ÉTAPE 1/2: Création mandat...');
 
-    // ÉTAPE 1 : Créer le mandat (même logique que /create-mandate)
-    const customerResponse = await axios.post(`${apiUrl}/customers`, {
+      const customerResponse = await axios.post(`${apiUrl}/customers`, {
       customers: {
         email: `${account_holder_name.toLowerCase().replace(/\s+/g, '.')}@example.com`,
         given_name: account_holder_name.split(' ')[0] || account_holder_name,
@@ -754,84 +764,87 @@ app.post('/create-maintenance-subscription', async (req, res) => {
       }
     });
 
-    const customerId = customerResponse.data.customers.id;
-    console.log('[GoCardless] ✅ Client créé:', customerId);
+      customerId = customerResponse.data.customers.id;
+      console.log('[GoCardless] ✅ Client créé:', customerId);
 
-    const cleanIban = iban.replace(/\s/g, '').toUpperCase();
-    const cleanAccountHolderName = account_holder_name.trim();
+      const cleanIban = iban.replace(/\s/g, '').toUpperCase();
+      const cleanAccountHolderName = account_holder_name.trim();
 
-    const bankAccountResponse = await axios.post(`${apiUrl}/customer_bank_accounts`, {
-      customer_bank_accounts: {
-        account_holder_name: cleanAccountHolderName,
-        iban: cleanIban,
-        links: { customer: customerId }
-      }
-    }, {
-      headers: {
-        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
-        'GoCardless-Version': '2015-07-06',
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const bankAccountId = bankAccountResponse.data.customer_bank_accounts.id;
-    console.log('[GoCardless] ✅ Compte bancaire créé:', bankAccountId);
-
-    const limitedMetadata = {
-      contractNumber: metadata?.contractNumber || '',
-      maintenanceId: metadata?.maintenanceId || '',
-      clientId: metadata?.clientId || ''
-    };
-
-    const mandateResponse = await axios.post(`${apiUrl}/mandates`, {
-      mandates: {
-        scheme: 'sepa_core',
-        links: {
-          customer_bank_account: bankAccountId,
-          creditor: process.env.GOCARDLESS_CREDITOR_ID
-        },
-        metadata: limitedMetadata
-      }
-    }, {
-      headers: {
-        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
-        'GoCardless-Version': '2015-07-06',
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const mandateId = mandateResponse.data.mandates.id;
-    console.log('[GoCardless] ✅ Mandat créé:', mandateId);
-
-    // Activer le mandat
-    try {
-      await axios.post(`${apiUrl}/mandates/${mandateId}/actions/activate`, {}, {
+      const bankAccountResponse = await axios.post(`${apiUrl}/customer_bank_accounts`, {
+        customer_bank_accounts: {
+          account_holder_name: cleanAccountHolderName,
+          iban: cleanIban,
+          links: { customer: customerId }
+        }
+      }, {
         headers: {
           'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
           'GoCardless-Version': '2015-07-06',
           'Content-Type': 'application/json'
         }
       });
-      console.log('[GoCardless] ✅ Mandat activé');
-    } catch (activationError) {
-      console.log('[GoCardless] ℹ️ Mandat déjà actif ou activation non nécessaire');
+
+      bankAccountId = bankAccountResponse.data.customer_bank_accounts.id;
+      console.log('[GoCardless] ✅ Compte bancaire créé:', bankAccountId);
+
+      const mandateResponse = await axios.post(`${apiUrl}/mandates`, {
+        mandates: {
+          scheme: 'sepa_core',
+          links: {
+            customer_bank_account: bankAccountId,
+            creditor: process.env.GOCARDLESS_CREDITOR_ID
+          },
+          metadata: limitedMetadata
+        }
+      }, {
+        headers: {
+          'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+          'GoCardless-Version': '2015-07-06',
+          'Content-Type': 'application/json'
+        }
+      });
+
+      mandateId = mandateResponse.data.mandates.id;
+      mandateStatus = mandateResponse.data.mandates.status;
+      console.log('[GoCardless] ✅ Mandat créé:', mandateId);
+
+      try {
+        await axios.post(`${apiUrl}/mandates/${mandateId}/actions/activate`, {}, {
+          headers: {
+            'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+            'GoCardless-Version': '2015-07-06',
+            'Content-Type': 'application/json'
+          }
+        });
+        console.log('[GoCardless] ✅ Mandat activé');
+      } catch (activationError) {
+        console.log('[GoCardless] ℹ️ Mandat déjà actif ou activation non nécessaire');
+      }
     }
 
     console.log('[GoCardless] 🔸 ÉTAPE 2/2: Création subscription...');
 
-    // ÉTAPE 2 : Créer la subscription
+    // day_of_month : 1-28 ou -1 (dernier jour). Obligatoire pour monthly/yearly.
+    // Sans start_date, GoCardless utilise next_possible_charge_date du mandat (doc GoCardless).
+    const dayOfMonth = typeof req.body.day_of_month === 'number' && req.body.day_of_month >= 1 && req.body.day_of_month <= 28
+      ? req.body.day_of_month
+      : (req.body.day_of_month === -1 ? -1 : 1);
+
+    // Doc GoCardless : amount et day_of_month en string dans les exemples
+    const amountMinor = String(Math.round(amount * 100));
     const subscriptionBody = {
       subscriptions: {
-        amount: Math.round(amount * 100),
+        amount: amountMinor,
         currency,
-        name: metadata?.contractNumber ? `Maintenance ${metadata.contractNumber}` : `Subscription ${mandateId}`,
+        name: (metadata?.contractNumber ? `Maintenance ${metadata.contractNumber}` : `Subscription ${mandateId}`).slice(0, 255),
         interval_unit,
         interval,
+        day_of_month: String(dayOfMonth),
         links: { mandate: mandateId },
-        ...(start_date && { start_date }),
         metadata: limitedMetadata
       }
     };
+    console.log('[GoCardless] Body subscription envoyé:', JSON.stringify(subscriptionBody, null, 2));
 
     const subscriptionResponse = await axios.post(`${apiUrl}/subscriptions`, subscriptionBody, {
       headers: {
@@ -848,23 +861,23 @@ app.post('/create-maintenance-subscription', async (req, res) => {
     if (metadata?.maintenanceId && db) {
       try {
         const maintenanceRef = doc(db, 'maintenances', metadata.maintenanceId);
-        await updateDoc(maintenanceRef, {
-          // Données du mandat
+        const firestoreUpdate = {
           mandateId: mandateId,
-          mandateStatus: mandateResponse.data.mandates.status,
-          customerId: customerId,
-          bankAccountId: bankAccountId,
-          // Données de la subscription
+          mandateStatus: mandateStatus || 'active',
           subscriptionId: subscription.id,
           subscriptionStatus: subscription.status,
           billingIntervalUnit: interval_unit,
           billingInterval: interval,
           nextChargeDate: subscription.next_charge_date || null,
-          // État du contrat
           contractStartDate: start_date || new Date().toISOString().split('T')[0],
-          billingMode: 'subscription', // ✅ Marquer comme utilisant les subscriptions
+          billingMode: 'subscription',
           updatedAt: new Date().toISOString()
-        });
+        };
+        if (customerId) firestoreUpdate.customerId = customerId;
+        if (bankAccountId) firestoreUpdate.bankAccountId = bankAccountId;
+        firestoreUpdate.gocardlessSubscriptionPending = false;
+        firestoreUpdate.gocardlessMandateId = mandateId;
+        await updateDoc(maintenanceRef, firestoreUpdate);
         console.log('[GoCardless] ✅ Firestore mis à jour:', metadata.maintenanceId);
       } catch (firestoreError) {
         console.error('[GoCardless] ⚠️ Erreur Firestore:', firestoreError.message);
@@ -879,33 +892,37 @@ app.post('/create-maintenance-subscription', async (req, res) => {
       success: true,
       mandate: {
         id: mandateId,
-        status: mandateResponse.data.mandates.status
+        status: mandateStatus || 'active'
       },
       subscription: {
         id: subscription.id,
         status: subscription.status,
         nextChargeDate: subscription.next_charge_date
       },
-      customer: {
-        id: customerId
-      },
-      bankAccount: {
-        id: bankAccountId
-      },
-      message: 'Mandat et subscription créés. GoCardless gérera les prélèvements automatiques chaque mois.'
+      customer: customerId ? { id: customerId } : null,
+      bankAccount: bankAccountId ? { id: bankAccountId } : null,
+      message: existingMandateId
+        ? 'Abonnement créé avec le mandat existant.'
+        : 'Mandat et subscription créés. GoCardless gérera les prélèvements automatiques chaque mois.'
     });
 
   } catch (error) {
-    console.error('[GoCardless] ❌ Erreur création mandat+subscription:', {
-      message: error.message,
-      status: error.response?.status,
-      data: error.response?.data,
-      url: error.config?.url
-    });
+    const errData = error.response?.data;
+    const validationErrors = errData?.error?.errors;
+    console.error('[GoCardless] ❌ Erreur création mandat+subscription:', error.message, error.response?.status, error.config?.url);
+    if (Array.isArray(validationErrors)) {
+      console.error('[GoCardless] Détail validation_errors:', JSON.stringify(validationErrors, null, 2));
+      validationErrors.forEach((e, i) => {
+        console.error(`[GoCardless]   #${i + 1}`, e?.field, e?.message || e?.reason || e);
+      });
+    } else {
+      console.error('[GoCardless] Réponse complète:', JSON.stringify(errData, null, 2));
+    }
 
     res.status(error.response?.status || 500).json({
       error: 'Erreur lors de la création du mandat et de la subscription',
-      details: error.response?.data || error.message
+      details: errData || error.message,
+      validationErrors: validationErrors || undefined
     });
   }
 });
