@@ -746,9 +746,14 @@ app.post('/create-maintenance-subscription', async (req, res) => {
       const countryCode = getCountryCode(metadata?.country);
       console.log('[GoCardless] 🔸 ÉTAPE 1/2: Création mandat...');
 
+      // Email : utiliser l'email client réel (metadata.clientEmail) si valide, sinon générer à partir du nom
+      const rawEmail = metadata?.clientEmail || metadata?.email;
+      const isValidEmail = typeof rawEmail === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawEmail.trim());
+      const customerEmail = isValidEmail ? rawEmail.trim() : `${account_holder_name.toLowerCase().replace(/\s+/g, '.')}@example.com`;
+
       const customerResponse = await axios.post(`${apiUrl}/customers`, {
       customers: {
-        email: `${account_holder_name.toLowerCase().replace(/\s+/g, '.')}@example.com`,
+        email: customerEmail,
         given_name: account_holder_name.split(' ')[0] || account_holder_name,
         family_name: account_holder_name.split(' ').slice(1).join(' ') || account_holder_name,
         address_line1: metadata?.address || 'Adresse non spécifiée',
@@ -1517,10 +1522,13 @@ app.post('/create-mandate', async (req, res) => {
     const countryCode = getCountryCode(metadata?.country);
     console.log('[GoCardless] Code pays utilisé:', countryCode, '(depuis:', metadata?.country, ')');
 
-    // 1. Créer le client
+    // 1. Créer le client (email réel si metadata.clientEmail/metadata.email, sinon généré)
+    const rawEmail1 = metadata?.clientEmail || metadata?.email;
+    const validEmail1 = typeof rawEmail1 === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawEmail1.trim());
+    const customerEmail1 = validEmail1 ? rawEmail1.trim() : `${account_holder_name.toLowerCase().replace(/\s+/g, '.')}@example.com`;
     const customerResponse = await axios.post(`${apiUrl}/customers`, {
       customers: {
-        email: `${account_holder_name.toLowerCase().replace(/\s+/g, '.')}@example.com`,
+        email: customerEmail1,
         given_name: account_holder_name.split(' ')[0] || account_holder_name,
         family_name: account_holder_name.split(' ').slice(1).join(' ') || account_holder_name,
         address_line1: metadata?.address || 'Adresse non spécifiée',
@@ -1688,10 +1696,13 @@ app.post('/create-mandate-sandbox', async (req, res) => {
     const countryCode = getCountryCode(metadata?.country);
     console.log('[GoCardless] Code pays utilisé:', countryCode, '(depuis:', metadata?.country, ')');
 
-    // 1. Créer le client
+    // 1. Créer le client (email réel si metadata.clientEmail/metadata.email, sinon généré)
+    const rawEmail2 = metadata?.clientEmail || metadata?.email;
+    const validEmail2 = typeof rawEmail2 === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawEmail2.trim());
+    const customerEmail2 = validEmail2 ? rawEmail2.trim() : `${account_holder_name.toLowerCase().replace(/\s+/g, '.')}@example.com`;
     const customerResponse = await axios.post(`${apiUrl}/customers`, {
       customers: {
-        email: `${account_holder_name.toLowerCase().replace(/\s+/g, '.')}@example.com`,
+        email: customerEmail2,
         given_name: account_holder_name.split(' ')[0] || account_holder_name,
         family_name: account_holder_name.split(' ').slice(1).join(' ') || account_holder_name,
         address_line1: metadata?.address || 'Adresse non spécifiée',
