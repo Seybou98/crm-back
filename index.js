@@ -2688,6 +2688,50 @@ app.get('/api/gocardless/payment-status/:paymentId', async (req, res) => {
   }
 });
 
+// GET : statut d'un abonnement GoCardless (pour la fiche maintenance - bouton "Rafraîchir le statut")
+app.get('/api/gocardless/subscription-status', async (req, res) => {
+  try {
+    const subscriptionId = req.query.subscriptionId;
+
+    if (!subscriptionId || typeof subscriptionId !== 'string') {
+      return res.status(400).json({ error: 'Paramètre subscriptionId requis (query)' });
+    }
+
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ error: 'GOCARDLESS_ACCESS_TOKEN manquant' });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.get(`${apiUrl}/subscriptions/${subscriptionId}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const sub = response.data.subscriptions || response.data.subscription;
+    if (!sub) {
+      return res.status(404).json({ error: 'Abonnement non trouvé', subscriptionId });
+    }
+
+    res.json({
+      status: sub.status,
+      next_charge_date: sub.next_charge_date || null,
+      subscription: sub
+    });
+  } catch (error) {
+    const status = error.response?.status;
+    const data = error.response?.data;
+    console.error('[GoCardless] Erreur statut abonnement:', data || error.message);
+    res.status(status || 500).json({
+      error: 'Erreur lors de la récupération du statut de l\'abonnement',
+      message: data?.error?.message || error.message,
+      details: data
+    });
+  }
+});
+
 // GET : récupérer un mandat par ID (AJOUTÉ)
 app.get('/mandates/:id', async (req, res) => {
   try {
@@ -3012,6 +3056,208 @@ app.post('/api/gocardless/sync-all-payments', async (req, res) => {
     res.status(500).json({
       error: 'Erreur lors de la synchronisation des paiements',
       details: error.response?.data || error.message
+    });
+  }
+});
+
+// POST : Synchroniser les statuts de paiement d'une seule maintenance depuis l'API GoCardless
+app.post('/api/gocardless/sync-maintenance-payments', async (req, res) => {
+  try {
+    const { maintenanceId } = req.body || {};
+    if (!maintenanceId) {
+      return res.status(400).json({ error: 'maintenanceId requis dans le body' });
+    }
+
+    if (!db) {
+      console.error('[GoCardless] sync-maintenance-payments: Firebase (db) non initialisé');
+      return res.status(503).json({ error: 'Base de données non disponible', details: 'Firebase non initialisé' });
+    }
+
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ error: 'GOCARDLESS_ACCESS_TOKEN manquant' });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const headers = {
+      'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+      'GoCardless-Version': '2015-07-06',
+      'Content-Type': 'application/json'
+    };
+
+    const maintenanceRef = doc(db, 'maintenances', maintenanceId);
+    const maintenanceSnap = await getDoc(maintenanceRef);
+    if (!maintenanceSnap.exists()) {
+      return res.status(404).json({ error: 'Maintenance non trouvée' });
+    }
+
+    const maintenance = { id: maintenanceSnap.id, ...maintenanceSnap.data() };
+    const paymentSchedule = maintenance.paymentSchedule || [];
+    const contractNumber = (maintenance.contractNumber || '').trim();
+
+    const statusMapping = {
+      confirmed: 'confirmed',
+      paid_out: 'paid_out',
+      failed: 'failed',
+      cancelled: 'cancelled',
+      charged_back: 'charged_back',
+      submitted: 'submitted',
+      pending_submission: 'pending_submission',
+      pending_customer_approval: 'pending'
+    };
+    const scheduleStatusMapping = {
+      paid_out: 'paid',
+      confirmed: 'paid',
+      failed: 'failed',
+      cancelled: 'failed',
+      charged_back: 'failed',
+      submitted: 'processing',
+      pending_submission: 'pending'
+    };
+
+    // 1) Collecter les payment IDs déjà connus sur la maintenance
+    const paymentIds = new Set();
+    if (maintenance.goCardlessPaymentId) paymentIds.add(maintenance.goCardlessPaymentId);
+    paymentSchedule.forEach(item => {
+      if (item.gocardlessPaymentId) paymentIds.add(item.gocardlessPaymentId);
+    });
+
+    // 2) Si aucun ID enregistré mais on a un numéro de contrat, récupérer les paiements GoCardless par description
+    if (paymentIds.size === 0 && contractNumber) {
+      try {
+        const listRes = await axios.get(`${apiUrl}/payments?limit=300`, { headers });
+        const allPayments = listRes.data.payments || [];
+        const contractMatch = contractNumber.includes('CONTRACT-') ? contractNumber : `CONTRACT-${contractNumber}`;
+        const matching = allPayments.filter(p => (p.description || '').includes(contractMatch));
+        matching.forEach(p => paymentIds.add(p.id));
+        if (matching.length > 0) {
+          console.log(`[GoCardless] ${matching.length} paiement(s) trouvé(s) par contrat "${contractMatch}" pour maintenance ${maintenanceId}`);
+        }
+      } catch (err) {
+        console.error('[GoCardless] Erreur liste paiements:', err.response?.data || err.message);
+      }
+    }
+
+    if (paymentIds.size === 0) {
+      return res.json({
+        success: true,
+        message: 'Aucun paiement GoCardless trouvé pour cette maintenance (vérifiez le numéro de contrat)',
+        stats: { paymentsChecked: 0, scheduleUpdated: false }
+      });
+    }
+
+    // 3) Récupérer le détail de chaque paiement
+    const paymentStatusById = {};
+    for (const paymentId of paymentIds) {
+      try {
+        const response = await axios.get(`${apiUrl}/payments/${paymentId}`, { headers });
+        const p = response.data.payments;
+        const mapped = statusMapping[p.status] || p.status;
+        const scheduleStatus = scheduleStatusMapping[mapped] || 'pending';
+        const chargeDate = (p.charge_date || '').substring(0, 10);
+        paymentStatusById[paymentId] = { paymentStatus: mapped, scheduleStatus, chargeDate };
+      } catch (err) {
+        console.error(`[GoCardless] Erreur récupération paiement ${paymentId}:`, err.response?.data || err.message);
+      }
+    }
+
+    // 4) Statut principal affiché dans la liste : "meilleur" statut parmi tous les paiements (si un est Versé → afficher Versé)
+    const statusPriority = { paid_out: 4, confirmed: 3, submitted: 2, pending_submission: 1, pending: 0, failed: -1, cancelled: -2, charged_back: -3 };
+    let mainPaymentStatus = maintenance.paymentStatus || 'pending';
+    let mainPaymentId = maintenance.goCardlessPaymentId;
+    if (Object.keys(paymentStatusById).length > 0) {
+      let bestPriority = statusPriority[mainPaymentStatus] ?? -10;
+      let bestId = mainPaymentId && paymentStatusById[mainPaymentId] ? mainPaymentId : null;
+      for (const [payId, info] of Object.entries(paymentStatusById)) {
+        const p = statusPriority[info.paymentStatus] ?? -10;
+        if (p > bestPriority) {
+          bestPriority = p;
+          bestId = payId;
+          mainPaymentStatus = info.paymentStatus;
+        }
+      }
+      if (bestId) mainPaymentId = bestId;
+      // Si aucun "meilleur" trouvé, garder le plus récent par date pour mainPaymentId
+      if (!mainPaymentId) {
+        const sortedIds = Object.entries(paymentStatusById)
+          .sort((a, b) => (b[1].chargeDate || '').localeCompare(a[1].chargeDate || ''));
+        if (sortedIds.length > 0) mainPaymentId = sortedIds[0][0];
+      }
+    }
+
+    // 5) Mettre à jour l'échéancier : par paymentId connu, ou par date de charge (charge_date <-> dueDate)
+    const updatedSchedule = paymentSchedule.map(item => {
+      const pid = item.gocardlessPaymentId;
+      if (pid && paymentStatusById[pid]) {
+        const { scheduleStatus } = paymentStatusById[pid];
+        return {
+          ...item,
+          status: scheduleStatus,
+          gocardlessPaymentId: pid,
+          updatedAt: new Date().toISOString(),
+          ...(scheduleStatus === 'paid' && { paidAt: new Date().toISOString() }),
+          ...(scheduleStatus === 'failed' && { failedAt: new Date().toISOString() })
+        };
+      }
+      const dueStr = (item.dueDate || '').substring(0, 10);
+      for (const [payId, info] of Object.entries(paymentStatusById)) {
+        if (info.chargeDate === dueStr) {
+          return {
+            ...item,
+            status: info.scheduleStatus,
+            gocardlessPaymentId: payId,
+            updatedAt: new Date().toISOString(),
+            ...(info.scheduleStatus === 'paid' && { paidAt: new Date().toISOString() }),
+            ...(info.scheduleStatus === 'failed' && { failedAt: new Date().toISOString() })
+          };
+        }
+        const itemYearMonth = dueStr.substring(0, 7);
+        const chargeYearMonth = (info.chargeDate || '').substring(0, 7);
+        if (itemYearMonth === chargeYearMonth && Math.abs(new Date(dueStr).getDate() - new Date(info.chargeDate).getDate()) <= 7) {
+          return {
+            ...item,
+            status: info.scheduleStatus,
+            gocardlessPaymentId: payId,
+            updatedAt: new Date().toISOString(),
+            ...(info.scheduleStatus === 'paid' && { paidAt: new Date().toISOString() }),
+            ...(info.scheduleStatus === 'failed' && { failedAt: new Date().toISOString() })
+          };
+        }
+      }
+      return item;
+    });
+
+    const scheduleChanged = JSON.stringify(updatedSchedule) !== JSON.stringify(paymentSchedule) ||
+      mainPaymentStatus !== (maintenance.paymentStatus || 'pending');
+
+    if (scheduleChanged) {
+      const updateData = {
+        paymentStatus: mainPaymentStatus,
+        paymentSchedule: updatedSchedule,
+        paymentMethod: maintenance.paymentMethod || 'gocardless',
+        updatedAt: new Date(),
+        lastPaymentSync: new Date()
+      };
+      if (mainPaymentId) updateData.goCardlessPaymentId = mainPaymentId;
+      await updateDoc(maintenanceRef, updateData);
+      console.log(`[GoCardless] ✅ Maintenance ${maintenanceId} synchronisée: ${Object.keys(paymentStatusById).length} paiement(s), statut principal → ${mainPaymentStatus}`);
+    }
+
+    res.json({
+      success: true,
+      message: scheduleChanged ? 'Échéancier mis à jour depuis GoCardless' : 'Déjà à jour',
+      stats: {
+        paymentsChecked: paymentIds.size,
+        scheduleUpdated: scheduleChanged
+      }
+    });
+  } catch (error) {
+    const details = error.response?.data || error.message;
+    const stack = error.stack;
+    console.error('[GoCardless] Erreur sync-maintenance-payments:', details);
+    if (stack) console.error('[GoCardless] Stack:', stack);
+    res.status(500).json({
+      error: 'Erreur lors de la synchronisation des paiements de la maintenance',
+      details: typeof details === 'string' ? details : JSON.stringify(details)
     });
   }
 });
