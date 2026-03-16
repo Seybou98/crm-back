@@ -7,8 +7,10 @@ if (result.error) {
 } else {
   console.log('✅ Fichier .env chargé avec succès');
   console.log('🔑 Variables d\'environnement chargées:', {
-    YOUSIGN_API_KEY: process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE',
-    YOUSIGN_API_URL: process.env.YOUSIGN_API_URL,
+    DOCUSIGN_INTEGRATION_KEY: process.env.DOCUSIGN_INTEGRATION_KEY ? 'PRÉSENTE' : 'MANQUANTE',
+    DOCUSIGN_USER_ID: process.env.DOCUSIGN_USER_ID ? 'PRÉSENTE' : 'MANQUANTE',
+    DOCUSIGN_ACCOUNT_ID: process.env.DOCUSIGN_ACCOUNT_ID ? 'PRÉSENTE' : 'MANQUANTE',
+    DOCUSIGN_PRIVATE_KEY: process.env.DOCUSIGN_PRIVATE_KEY ? 'PRÉSENTE' : 'MANQUANTE',
     SUMUP_CLIENT_ID: process.env.SUMUP_CLIENT_ID ? 'PRÉSENTE' : 'MANQUANTE',
     SUMUP_CLIENT_SECRET: process.env.SUMUP_CLIENT_SECRET ? 'PRÉSENTE' : 'MANQUANTE',
     SUMUP_MERCHANT_CODE: process.env.SUMUP_MERCHANT_CODE || 'MANQUANT',
@@ -28,6 +30,9 @@ const testRoutes = require('./test-endpoints');
 
 // Importer le service SumUp
 const sumupService = require('./sumup-service');
+
+// Service DocuSign (signature électronique - remplace YouSign)
+const docusignService = require('./docusign-service');
 
 // Imports Firestore pour la synchronisation YouSign
 const { initializeApp } = require('firebase/app');
@@ -175,15 +180,7 @@ function getCountryCode(countryName) {
   return 'FR';
 }
 
-// Configuration YouSign dynamique pour production
-// Normaliser l'URL pour s'assurer qu'elle se termine par /v3
-let YOUSIGN_API_URL = process.env.YOUSIGN_API_URL || 'https://api-sandbox.yousign.app/v3';
-if (!YOUSIGN_API_URL.endsWith('/v3')) {
-  // Si l'URL ne se termine pas par /v3, l'ajouter
-  YOUSIGN_API_URL = YOUSIGN_API_URL.replace(/\/+$/, '') + '/v3';
-}
-console.log('[YouSign] URL API normalisée:', YOUSIGN_API_URL);
-const YOUSIGN_API_TOKEN = process.env.YOUSIGN_API_KEY;
+// Signature électronique : DocuSign (exclusif, remplace YouSign)
 const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || 'service_wl6kjuo';
 const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID || 'template_nfsa5wv';
 const EMAILJS_USER_ID = process.env.EMAILJS_USER_ID || '9DbPDdjUGFwv3WVZ0';
@@ -493,144 +490,6 @@ async function processGoCardlessPaymentEvent(event) {
   }
 }
 
-// Utilitaire axios Yousign
-const yousignApi = axios.create({
-  baseURL: YOUSIGN_API_URL,
-  headers: {
-    Authorization: `Bearer ${YOUSIGN_API_TOKEN}`,
-  }
-});
-
-// 1. Créer la demande de signature
-async function createSignatureRequest(name = 'My Signature Request') {
-  try {
-    console.log('[YouSign] Appel API pour créer la demande de signature');
-    console.log('[YouSign] URL complète:', `${YOUSIGN_API_URL}/signature_requests`);
-    console.log('[YouSign] Données:', { name, delivery_mode: 'email' });
-    const res = await yousignApi.post('/signature_requests', {
-      name,
-      delivery_mode: 'email'
-    });
-    console.log('[YouSign] Réponse reçue:', res.status, res.statusText);
-    return res.data.id;
-  } catch (error) {
-    console.error('[YouSign] Erreur lors de la création de la demande:', error.response?.data || error.message);
-    console.error('[YouSign] URL appelée:', error.config?.url);
-    console.error('[YouSign] Méthode:', error.config?.method);
-    throw error;
-  }
-}
-
-// 2. Uploader le document
-async function uploadDocument(signatureRequestId, pdfPath) {
-  const form = new FormData();
-  form.append('file', fs.createReadStream(pdfPath));
-  form.append('nature', 'signable_document');
-  const res = await yousignApi.post(
-    `/signature_requests/${signatureRequestId}/documents`,
-    form,
-    { headers: { ...form.getHeaders(), Authorization: `Bearer ${YOUSIGN_API_TOKEN}` } }
-  );
-  return res.data.id;
-}
-
-// 3. Ajouter le signataire et le champ de signature
-async function addSigner(signatureRequestId, documentId, firstName, lastName, email, signaturePosition = null) {
-  // ✅ CORRECTION : Position par défaut pour la zone "Signature client" en bas de la page 2
-  // Dans YouSign, l'origine (0,0) est en bas à gauche de la page
-  // Pour un document A4 : largeur ~595 points, hauteur ~842 points
-  // La zone de signature est en bas de la page 2, à gauche
-  const defaultPosition = {
-    page: 2,        // Page 2 où se trouve "Signature client"
-    x: 100,         // Position horizontale (gauche)
-    y: 80,          // Position verticale depuis le bas (zone "Signature client")
-    width: 200,     // Largeur du champ de signature
-    height: 60      // Hauteur du champ de signature
-  };
-
-  const position = signaturePosition || defaultPosition;
-
-  const res = await yousignApi.post(
-    `/signature_requests/${signatureRequestId}/signers`,
-    {
-      info: {
-        first_name: firstName,
-        last_name: lastName,
-        email,
-        locale: 'fr'
-      },
-      signature_level: 'electronic_signature',
-      signature_authentication_mode: 'no_otp',
-      delivery_mode: 'email', // <-- AJOUTÉ pour forcer la génération du lien et l'envoi de l'email
-      fields: [
-        {
-          type: 'signature',
-          document_id: documentId,
-          page: position.page,
-          x: position.x,
-          y: position.y,
-          ...(position.width && { width: position.width }),
-          ...(position.height && { height: position.height })
-        }
-      ]
-    }
-  );
-  return res.data;
-}
-
-// 4. Activer la demande de signature
-async function activateSignatureRequest(signatureRequestId) {
-  await yousignApi.post(`/signature_requests/${signatureRequestId}/activate`);
-}
-
-// 5. Récupérer le lien de signature
-async function getSignatureRequest(signatureRequestId) {
-  const res = await yousignApi.get(`/signature_requests/${signatureRequestId}`);
-  return res.data;
-}
-
-// Utilitaire pour envoyer l'email via EmailJS
-async function sendEmailWithSignatureLink(emailVars) {
-  await axios.post('https://api.emailjs.com/api/v1.0/email/send', {
-    service_id: EMAILJS_SERVICE_ID,
-    template_id: EMAILJS_TEMPLATE_ID,
-    user_id: EMAILJS_USER_ID,
-    template_params: emailVars
-  });
-}
-
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
-});
-
-// Utilitaire pour envoyer l'email avec le lien de signature
-async function sendMailWithSignatureLink({ to, subject, html }) {
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM,
-    to,
-    subject,
-    html
-  });
-}
-
-// Fonction utilitaire pour attendre le lien de signature Yousign
-async function waitForSignatureLink(signatureRequestId, signerId, maxTries = 10, delayMs = 1000) {
-  for (let i = 0; i < maxTries; i++) {
-    const signatureRequest = await getSignatureRequest(signatureRequestId);
-    const signer = signatureRequest.signers.find(s => s.id === signerId);
-    console.log(`[Yousign] Tentative ${i + 1}: signature_link=`, signer?.signature_link);
-    if (signer && signer.signature_link) {
-      return signer.signature_link;
-    }
-    await new Promise(res => setTimeout(res, delayMs));
-  }
-  return null;
-}
-
 // Endpoint principal
 
 // POST : créer une subscription GoCardless (réccurence gérée par GoCardless)
@@ -932,391 +791,164 @@ app.post('/create-maintenance-subscription', async (req, res) => {
   }
 });
 
+// POST /api/yousign/signature-request — DocuSign (même contrat API pour le frontend)
 app.post('/api/yousign/signature-request', async (req, res) => {
   try {
-    console.log('[Yousign] Requête reçue body:', req.body);
-    const {
-      pdfUrl, // <-- on attend maintenant un lien Firebase Storage
-      signerFirstName,
-      signerLastName,
-      signerEmail,
-      client_address,
-      contract_number,
-      equipment_name,
-      contract_start_date,
-      contract_end_date,
-      monthly_amount
-    } = req.body;
-    if (!pdfUrl || !signerFirstName || !signerLastName || !signerEmail) {
-      console.log('[Yousign] Champs manquants:', { pdfUrl, signerFirstName, signerLastName, signerEmail });
-      return res.status(400).json({ error: 'pdfUrl, signerFirstName, signerLastName, signerEmail sont requis' });
+    if (!docusignService.isConfigured()) {
+      return res.status(503).json({ error: 'DocuSign non configuré (variables d\'environnement manquantes)' });
     }
-
-    // 1. Télécharger le PDF depuis Firebase Storage
-    const path = require('path');
-    const tempPath = path.join(__dirname, 'temp_contract.pdf');
-    console.log('[Yousign] Téléchargement du PDF depuis:', pdfUrl);
-    const response = await axios.get(pdfUrl, { responseType: 'stream' });
-    const writer = require('fs').createWriteStream(tempPath);
-    await new Promise((resolve, reject) => {
-      response.data.pipe(writer);
-      writer.on('finish', resolve);
-      writer.on('error', reject);
-    });
-    console.log('[Yousign] PDF téléchargé et sauvegardé temporairement:', tempPath);
-
-    // 2. Créer la demande Yousign avec le fichier temporaire
-    console.log('[Yousign] Création de la demande Yousign...');
-    const signatureRequestId = await createSignatureRequest('Signature contrat');
-    console.log('[Yousign] signatureRequestId:', signatureRequestId);
-    const documentId = await uploadDocument(signatureRequestId, tempPath);
-    console.log('[Yousign] documentId:', documentId);
-    const signer = await addSigner(signatureRequestId, documentId, signerFirstName, signerLastName, signerEmail);
-    console.log('[Yousign] signer:', signer);
-    await activateSignatureRequest(signatureRequestId);
-    console.log('[Yousign] Demande activée');
-
-    // ---
-    // Commenté temporairement : récupération et envoi du signature_link (non fiable en sandbox)
-    // const signatureLink = await waitForSignatureLink(signatureRequestId, signer.id);
-    // console.log('[Yousign] signatureLink (après polling):', signatureLink);
-    // if (!signatureLink) {
-    //   require('fs').unlinkSync(tempPath);
-    //   console.log('[Yousign] Fichier temporaire supprimé');
-    //   return res.status(500).json({ error: 'Lien de signature Yousign non généré après 10s. Réessayez dans quelques instants.' });
-    // }
-    // ---
-
-    // 3. Nettoyer le fichier temporaire
-    require('fs').unlinkSync(tempPath);
-    console.log('[Yousign] Fichier temporaire supprimé');
-
-    // 4. Envoi de l'email personnalisé désactivé (on laisse Yousign gérer l'invitation)
-    // const html = `
-    //   <h2>Contrat de maintenance à signer</h2>
-    //   <p>Bonjour <strong>${signerFirstName} ${signerLastName}</strong>,</p>
-    //   <p>
-    //     Veuillez <a href="${signatureLink}" target="_blank">cliquer ici pour signer votre contrat de maintenance</a>.
-    //   </p>
-    //   <p>Numéro de contrat : ${contract_number}</p>
-    //   <p>Adresse : ${client_address}</p>
-    //   <p>Équipement : ${equipment_name}</p>
-    //   <p>Date de début : ${contract_start_date}</p>
-    //   <p>Date de fin : ${contract_end_date}</p>
-    //   <p>Montant mensuel : ${monthly_amount}</p>
-    //   <br>
-    //   <p>L'équipe Label Energie</p>
-    // `;
-    // await sendMailWithSignatureLink({
-    //   to: signerEmail,
-    //   subject: 'Signature électronique de votre contrat de maintenance',
-    //   html
-    // });
-    // console.log('[Yousign] Email envoyé à', signerEmail);
-
-    // 5. Réponse au frontend (sans signatureLink)
+    console.log('[DocuSign] Requête signature reçue:', { pdfUrl: !!req.body.pdfUrl, signerEmail: req.body.signerEmail, signatureBlockPage: req.body.signatureBlockPage });
+    const { pdfUrl, signerFirstName, signerLastName, signerEmail, signatureBlockPage } = req.body;
+    if (!pdfUrl || !signerEmail) {
+      return res.status(400).json({ error: 'pdfUrl et signerEmail sont requis' });
+    }
+    const { envelopeId } = await docusignService.createEnvelopeFromPdfUrl(
+      pdfUrl,
+      signerEmail,
+      signerFirstName || '',
+      signerLastName || '',
+      {
+        emailSubject: 'Contrat à signer',
+        emailBody: 'Veuillez signer le document ci-joint.',
+        signatureBlockPage: signatureBlockPage != null ? Number(signatureBlockPage) : 1
+      }
+    );
     res.json({
-      signatureRequestId,
-      documentId,
-      signerId: signer.id,
-      // signatureLink, // <-- Commenté car non fiable en sandbox
+      signatureRequestId: envelopeId,
+      documentId: '1',
+      signerId: '1',
       status: 'ongoing'
     });
-    console.log('[Yousign] Réponse envoyée au frontend');
+    console.log('[DocuSign] Enveloppe créée:', envelopeId);
   } catch (error) {
-    console.error('[Yousign] Erreur:', error.response?.data || error.message, error.stack);
+    console.error('[DocuSign] Erreur:', error.response?.data || error.message);
     res.status(500).json({
-      error: 'Erreur lors du process Yousign',
-      details: error.response?.data || error.message
+      error: 'Erreur lors de la création de la demande de signature',
+      details: error.response?.data?.message || error.message
     });
   }
 });
 
-// GET : récupérer le statut et les infos d'une demande de signature
+// GET : statut d'une demande de signature (DocuSign — même contrat API)
 app.get('/api/yousign/signature-request/:id', async (req, res) => {
   try {
+    if (!docusignService.isConfigured()) {
+      return res.status(503).json({ error: 'DocuSign non configuré' });
+    }
     const { id } = req.params;
-    const signatureRequest = await getSignatureRequest(id);
-
-    // Extraire le statut de signature pour chaque signataire
-    const signatureStatus = signatureRequest.signers?.map(signer => ({
-      id: signer.id,
-      firstName: signer.info?.first_name,
-      lastName: signer.info?.last_name,
-      email: signer.info?.email,
-      status: signer.status, // 'initiated', 'signed', 'declined', etc.
-      signedAt: signer.signed_at,
-      signatureLink: signer.signature_link
-    })) || [];
-
+    const envelope = await docusignService.getEnvelopeStatus(id);
+    const statusMap = { sent: 'active', delivered: 'active', signed: 'active', completed: 'completed', declined: 'declined', voided: 'expired' };
+    const frontStatus = statusMap[envelope.status] || envelope.status;
     res.json({
-      id: signatureRequest.id,
-      name: signatureRequest.name,
-      status: signatureRequest.status, // 'draft', 'active', 'completed', 'expired'
-      createdAt: signatureRequest.created_at,
-      updatedAt: signatureRequest.updated_at,
-      signers: signatureStatus,
-      isCompleted: signatureRequest.status === 'completed' || signatureRequest.status === 'done',
-      isExpired: signatureRequest.status === 'expired'
+      id: envelope.envelopeId,
+      status: frontStatus,
+      signers: (envelope.signers || []).map(s => ({
+        id: s.id,
+        email: s.email,
+        status: s.status === 'completed' ? 'signed' : s.status,
+        signedAt: s.signedDateTime
+      })),
+      isCompleted: envelope.status === 'completed',
+      isExpired: envelope.status === 'voided'
     });
   } catch (error) {
-    console.error('[Yousign] Erreur GET:', error.response?.data || error.message);
-    res.status(500).json({
-      error: 'Erreur lors de la récupération de la demande Yousign',
-      details: error.response?.data || error.message
-    });
+    console.error('[DocuSign] Erreur GET statut:', error.response?.data || error.message);
+    
+    // ✅ Gestion erreur DocuSign : limite de polling horaire dépassée
+    if (error.errorCode === 'HOURLY_ENVELOPE_POLLING_LIMIT_EXCEEDED' || 
+        error.response?.data?.errorCode === 'HOURLY_ENVELOPE_POLLING_LIMIT_EXCEEDED') {
+      return res.status(429).json({
+        errorCode: 'HOURLY_ENVELOPE_POLLING_LIMIT_EXCEEDED',
+        message: error.message || error.response?.data?.message || 'Limite de polling horaire dépassée (250 appels/heure)',
+        data: { status: 'pending' } // Retourner un statut par défaut
+      });
+    }
+    
+    if (error.response?.status === 404) return res.status(404).json({ error: 'Enveloppe non trouvée' });
+    res.status(500).json({ error: 'Erreur récupération statut', details: error.response?.data?.message || error.message });
   }
 });
 
-// GET : télécharger le PDF signé (si disponible)
+// GET : télécharger le PDF signé (DocuSign)
 app.get('/api/yousign/signature-request/:id/document', async (req, res) => {
   try {
-    const { id } = req.params;
-    const signatureRequest = await getSignatureRequest(id);
-    const documentId = signatureRequest.documents?.[0]?.id;
-    if (!documentId) {
-      return res.status(404).json({ error: 'Aucun document trouvé pour cette demande.' });
+    if (!docusignService.isConfigured()) {
+      return res.status(503).json({ error: 'DocuSign non configuré' });
     }
-    // Télécharger le PDF signé (ou original si pas encore signé)
-    const docRes = await yousignApi.get(`/signature_requests/${id}/documents/${documentId}/download`, {
-      responseType: 'arraybuffer'
-    });
+    const { id } = req.params;
+    const pdfBuffer = await docusignService.getEnvelopeDocumentCombined(id);
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${documentId}.pdf"`);
-    res.send(docRes.data);
+    res.setHeader('Content-Disposition', `attachment; filename="Contrat_Signe_${id}.pdf"`);
+    res.send(pdfBuffer);
   } catch (error) {
-    console.error('[Yousign] Erreur download document:', error.response?.data || error.message);
-    res.status(500).json({
-      error: 'Erreur lors du téléchargement du document signé',
-      details: error.response?.data || error.message
-    });
+    console.error('[DocuSign] Erreur download:', error.response?.data || error.message);
+    if (error.response?.status === 404) return res.status(404).json({ error: 'Document non trouvé' });
+    res.status(500).json({ error: 'Erreur téléchargement document', details: error.response?.data?.message || error.message });
   }
 });
 
-// POST : Endpoint pour les devis SAV (signature électronique)
-app.post('/api/yousign-devis', async (req, res) => {
-  console.log('\n🔷 ====== REQUÊTE YOUSIGN DEVIS SAV ======');
-
+// GET : image de signature du signataire (pour affichage sur PDF contrat généré)
+app.get('/api/yousign/signature-request/:id/signature-image', async (req, res) => {
   try {
+    if (!docusignService.isConfigured()) {
+      return res.status(503).json({ error: 'DocuSign non configuré' });
+    }
+    const { id: envelopeId } = req.params;
+    const result = await docusignService.getRecipientSignatureImage(envelopeId, '1');
+    if (!result) {
+      return res.status(404).json({ error: 'Image de signature non disponible' });
+    }
+    res.setHeader('Content-Type', result.contentType);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.send(result.buffer);
+  } catch (error) {
+    console.error('[DocuSign] Erreur signature image:', error.response?.data || error.message);
+    if (error.response?.status === 404) return res.status(404).json({ error: 'Image non trouvée' });
+    res.status(500).json({ error: 'Erreur récupération image signature', details: error.response?.data?.message || error.message });
+  }
+});
+
+// POST : Endpoint devis SAV — DocuSign (même contrat API que YouSign)
+app.post('/api/yousign-devis', async (req, res) => {
+  console.log('\n🔷 ====== REQUÊTE DOCUSIGN DEVIS SAV ======');
+  try {
+    if (!docusignService.isConfigured()) {
+      return res.status(503).json({ success: false, error: 'DocuSign non configuré' });
+    }
     const { action, ...data } = req.body;
-    console.log('[Yousign-Devis] Action:', action);
+    console.log('[DocuSign-Devis] Action:', action);
 
     switch (action) {
       case 'create_signature_request': {
         const { pdfBase64, filename, signer, devisInfo } = data;
-        console.log('[Yousign-Devis] Devis:', devisInfo?.number);
-        console.log('[Yousign-Devis] Signataire:', signer?.email);
-
-        // Validation des données
         if (!pdfBase64 || !signer || !devisInfo) {
-          return res.status(400).json({
-            success: false,
-            error: 'Données manquantes: pdfBase64, signer, devisInfo requis'
-          });
+          return res.status(400).json({ success: false, error: 'Données manquantes: pdfBase64, signer, devisInfo requis' });
         }
-
-        // 1. Créer la signature request
-        console.log('[Yousign-Devis] Création de la demande de signature...');
-        const signatureRequestRes = await yousignApi.post('/signature_requests', {
-          name: `Devis SAV ${devisInfo.number}`,
-          delivery_mode: 'email',
-          timezone: 'Europe/Paris',
-          reminder_settings: {
-            interval_in_days: 7,
-            max_occurrences: 3
-          },
-          expiration_date: devisInfo.validUntil || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-          external_id: devisInfo.id
-        });
-        const signatureRequestId = signatureRequestRes.data.id;
-        console.log('[Yousign-Devis] Signature request créée:', signatureRequestId);
-
-        // 2. Upload du document PDF (depuis base64)
-        console.log('[Yousign-Devis] Upload du document...');
         const pdfBuffer = Buffer.from(pdfBase64, 'base64');
-        const FormData = require('form-data');
-        const form = new FormData();
-        form.append('file', pdfBuffer, {
-          filename: filename || `devis-${devisInfo.number}.pdf`,
-          contentType: 'application/pdf'
-        });
-        form.append('nature', 'signable_document');
-
-        const uploadRes = await axios.post(
-          `${YOUSIGN_API_URL}/signature_requests/${signatureRequestId}/documents`,
-          form,
-          { headers: { ...form.getHeaders(), Authorization: `Bearer ${YOUSIGN_API_TOKEN}` } }
+        const { envelopeId } = await docusignService.createEnvelopeFromPdfBuffer(
+          pdfBuffer,
+          filename || `devis-${devisInfo.number}.pdf`,
+          signer.email,
+          signer.firstName || '',
+          signer.lastName || '',
+          { emailSubject: `Devis SAV ${devisInfo.number} à signer` }
         );
-        const documentId = uploadRes.data.id;
-        console.log('[Yousign-Devis] Document uploadé:', documentId);
-
-        // 3. Ajouter le signataire
-        console.log('[Yousign-Devis] Ajout du signataire...');
-
-        // Préparer les infos du signataire (sans téléphone si invalide)
-        const signerInfo = {
-          first_name: signer.firstName || 'Client',
-          last_name: signer.lastName || 'SAV',
-          email: signer.email,
-          locale: 'fr'
-        };
-
-        // Ajouter le téléphone seulement s'il est valide (format international +33...)
-        if (signer.phone) {
-          // Convertir en string si c'est un nombre
-          let phone = String(signer.phone).replace(/\s/g, '').replace(/\./g, '').replace(/-/g, '');
-          // Si le numéro commence par 0, le convertir en format international français
-          if (phone.startsWith('0')) {
-            phone = '+33' + phone.substring(1);
-          }
-          // Vérifier que le format est valide (commence par + et contient au moins 10 chiffres)
-          if (phone.startsWith('+') && phone.replace(/\D/g, '').length >= 10) {
-            signerInfo.phone_number = phone;
-            console.log('[Yousign-Devis] Téléphone formaté:', phone);
-          } else {
-            console.log('[Yousign-Devis] Téléphone ignoré (format invalide):', signer.phone);
-          }
-        }
-
-        // Calculer les coordonnées pour positionner la signature dans la zone "Le client"
-        // Pour un PDF A4 standard : 595 points de largeur x 842 points de hauteur
-        // IMPORTANT: Les coordonnées Yousign sont depuis le HAUT de la page (y=0 en haut)
-        // La signature est maintenant positionnée EN BAS du document, juste avant le footer
-        // (après les conditions générales, avant le footer)
-        // La signature doit être SUR la ligne de signature du client, pas en dessous
-
-        // Dimensions A4 en points (1 point = 1/72 inch)
-        const A4_WIDTH = 595;
-        const A4_HEIGHT = 842;
-
-        // Calcul de la position de la ligne de signature
-        // Le template a maintenant :
-        // - Header avec logo: ~80-100 points
-        // - Titre devis: ~100-180 points
-        // - Section CLIENT: ~180-250 points
-        // - Prestations: ~250-400 points
-        // - Conditions générales: ~400-550 points
-        // - Section signature: ~550-700 points (environ 65-83% de la hauteur) - À LA FIN
-        // - Footer: ~700-842 points
-
-        // Position de la zone de signature du client (section gauche)
-        // x: zone gauche du document (environ 8% de la largeur pour la colonne gauche)
-        // y: SUR la ligne de signature (border-top), positionnée en bas du document (après les conditions)
-        //    
-        // Calcul précis basé sur la structure CSS :
-        //    - Section .signatures commence vers 75-80% de la hauteur (~630-674 points)
-        //    - .signature-box : padding-top: 40px (≈ 30 points en PDF à 96 DPI)
-        //    - .signature-line : margin-top: 30px (≈ 22 points en PDF) + border-top (la ligne elle-même)
-        //    - La ligne border-top est donc à : début_signature_box + 30 + 22 = début + 52 points
-        //    - Pour un PDF A4 (842 points), section signatures à ~75% = 631 points
-        //    - Donc ligne border-top ≈ 631 + 52 = 683 points
-        //
-        // IMPORTANT: Yousign positionne Y depuis le HAUT de la zone de signature
-        // Pour que la signature soit DIRECTEMENT SUR la ligne border-top :
-        //    - Y doit être positionné à la hauteur de la ligne moins un petit offset
-        //    - Le texte de la signature Yousign apparaîtra légèrement au-dessus de la ligne si Y = ligne
-        //    - Pour que le texte soit SUR la ligne, réduire Y de 15-25 points
-        // Calcul précis basé sur la structure CSS réelle du template
-        // Section signatures commence vers 70% de la hauteur (réduit de 75% pour remonter le bloc)
-        // Pour remonter : réduire le pourcentage (ex: 0.70 au lieu de 0.75)
-        // Pour descendre : augmenter le pourcentage (ex: 0.80 au lieu de 0.75)
-        const sectionStartY = Math.round(A4_HEIGHT * 0.60); // ~589 points - début de la section signatures (remonté)
-
-        // Conversion CSS vers points PDF (1px CSS ≈ 0.75 points PDF à 96 DPI)
-        // .signature-box : padding-top: 40px ≈ 30 points
-        const signatureBoxPadding = Math.round(40 * 0.75); // 30 points
-
-        // .signature-line : margin-top: 30px ≈ 22 points
-        const signatureLineMargin = Math.round(30 * 0.75); // 22 points
-
-        // Position exacte de la ligne border-top
-        const linePosition = sectionStartY + signatureBoxPadding + signatureLineMargin; // ~684 points
-
-        // IMPORTANT: Yousign positionne le coin supérieur gauche de la zone de signature
-        // Pour que la signature soit SUR la ligne border-top, il faut :
-        // - Positionner Y légèrement au-dessus de la ligne pour que le texte soit sur la ligne
-        // - Le texte de la signature Yousign apparaît généralement 5-10 points sous le Y spécifié
-        // - Donc Y = linePosition - 25 à 30 points pour que le texte soit sur la ligne
-        // NOTE: Yousign exige une hauteur minimale de 37 points
-        const signatureHeight = 37; // Hauteur minimale requise par Yousign
-        const yOffset = 25; // Offset pour positionner le texte sur la ligne
-
-        const signatureField = {
-          type: 'signature',
-          document_id: documentId,
-          page: 1,
-          x: Math.round(A4_WIDTH * 0.08),      // ~48 points - zone gauche (client)
-          y: linePosition - yOffset,            // ~659 points - Position pour que le texte soit SUR la ligne
-          width: Math.round(A4_WIDTH * 0.30),   // ~179 points - largeur pour la zone client
-          height: signatureHeight,               // Hauteur de la zone
-          label: 'Signature du client'           // Label descriptif
-        };
-
-        console.log('[Yousign-Devis] Zone de signature configurée pour la zone "Le client":', {
-          ...signatureField,
-          position: `(${signatureField.x}, ${signatureField.y})`,
-          size: `${signatureField.width}x${signatureField.height}`,
-          pageDimensions: `${A4_WIDTH}x${A4_HEIGHT}`,
-          calculations: {
-            sectionStartY,
-            signatureBoxPadding,
-            signatureLineMargin,
-            linePosition,
-            yOffset,
-            finalY: signatureField.y,
-            distanceFromLine: linePosition - signatureField.y
-          },
-          note: `Signature positionnée à Y=${signatureField.y} (ligne à ${linePosition}). Le texte Yousign apparaîtra ~5-10 points sous Y, donc sur la ligne. Si besoin, ajuster yOffset (actuellement ${yOffset}).`
-        });
-
-        const signerRes = await yousignApi.post(
-          `/signature_requests/${signatureRequestId}/signers`,
-          {
-            info: signerInfo,
-            signature_level: 'electronic_signature',
-            signature_authentication_mode: 'no_otp',
-            fields: [signatureField]
-          }
-        );
-        const signerId = signerRes.data.id;
-        const signingUrl = signerRes.data.signature_link;
-        console.log('[Yousign-Devis] Signataire ajouté:', signerId);
-
-        // 4. Activer la demande
-        console.log('[Yousign-Devis] Activation de la demande...');
-        await yousignApi.post(`/signature_requests/${signatureRequestId}/activate`);
-        console.log('[Yousign-Devis] Demande activée');
-
-        console.log('✅ [Yousign-Devis] Processus complet terminé !');
-        console.log('🔗 [Yousign-Devis] Signature URL:', signingUrl);
-
-        // NOUVEAU: Créer automatiquement un lien de paiement SumUp
         let sumupPaymentUrl = null;
         let sumupCheckoutId = null;
         let sumupError = null;
-
-        try {
-          console.log('[Yousign-Devis] Création automatique du lien de paiement SumUp...');
-
-          // Vérifier si on a les informations nécessaires pour SumUp
-          if (signerInfo.email && data.amount) {
-            const sumupCheckoutData = {
+        if (signer.email && data.amount && sumupService.createCheckout) {
+          try {
+            const sumupResult = await sumupService.createCheckout({
               devisId: data.devisId || `DEVIS-${Date.now()}`,
               amount: parseFloat(data.amount),
               currency: data.currency || 'EUR',
-              clientEmail: signerInfo.email,
-              description: `Paiement ${data.devisNumber || 'devis'} - ${signerInfo.first_name} ${signerInfo.last_name}`,
+              clientEmail: signer.email,
+              description: `Paiement ${data.devisNumber || 'devis'}`,
               returnUrl: data.returnUrl || `${process.env.FRONTEND_URL || 'http://localhost:5173'}/sav/payment-success`
-            };
-
-            const sumupResult = await sumupService.createCheckout(sumupCheckoutData);
-
+            });
             if (sumupResult.success) {
               sumupPaymentUrl = sumupResult.payment_url;
               sumupCheckoutId = sumupResult.checkout_id;
-              console.log('[Yousign-Devis] ✅ Lien de paiement SumUp créé:', sumupPaymentUrl);
-
-              // Sauvegarder dans Firestore si disponible
               if (db && data.devisId) {
                 try {
                   const maintenanceRef = doc(db, 'maintenances', data.devisId);
@@ -1325,88 +957,48 @@ app.post('/api/yousign-devis', async (req, res) => {
                     sumup_payment_url: sumupPaymentUrl,
                     sumup_created_at: new Date().toISOString(),
                     sumup_status: sumupResult.status,
-                    yousign_signature_url: signingUrl,
-                    yousign_signature_request_id: signatureRequestId
+                    yousign_signature_request_id: envelopeId
                   });
-                  console.log('[Yousign-Devis] Liens YouSign et SumUp sauvegardés dans Firestore');
-                } catch (firestoreError) {
-                  console.warn('[Yousign-Devis] Erreur Firestore:', firestoreError.message);
-                }
+                } catch (e) { console.warn('[DocuSign-Devis] Firestore:', e.message); }
               }
-            } else {
-              sumupError = sumupResult.error;
-              console.warn('[Yousign-Devis] ⚠️ Erreur création lien SumUp:', sumupResult.error);
-            }
-          } else {
-            console.log('[Yousign-Devis] ℹ️ Informations insuffisantes pour créer le lien SumUp (email ou montant manquant)');
-          }
-        } catch (sumupErr) {
-          sumupError = sumupErr.message;
-          console.error('[Yousign-Devis] ❌ Erreur lors de la création du lien SumUp:', sumupErr);
+            } else sumupError = sumupResult.error;
+          } catch (e) { sumupError = e.message; }
         }
-
         return res.json({
           success: true,
-          signatureRequestId,
-          documentId,
-          signerId,
+          signatureRequestId: envelopeId,
+          documentId: '1',
+          signerId: '1',
           status: 'ongoing',
-          signingUrl,
-          // Ajouter les informations SumUp à la réponse
-          sumup: {
-            payment_url: sumupPaymentUrl,
-            checkout_id: sumupCheckoutId,
-            created: !!sumupPaymentUrl,
-            error: sumupError
-          }
+          signingUrl: null,
+          sumup: { payment_url: sumupPaymentUrl, checkout_id: sumupCheckoutId, created: !!sumupPaymentUrl, error: sumupError }
         });
       }
 
       case 'get_status': {
         const { signatureRequestId } = data;
-        console.log('[Yousign-Devis] Vérification statut:', signatureRequestId);
-
-        const statusRes = await yousignApi.get(`/signature_requests/${signatureRequestId}`);
-        const status = statusRes.data;
-
+        const envelope = await docusignService.getEnvelopeStatus(signatureRequestId);
+        const statusMap = { sent: 'ongoing', delivered: 'ongoing', signed: 'ongoing', completed: 'done', declined: 'declined', voided: 'expired' };
+        const signedAt = envelope.signers?.find(s => s.signedDateTime)?.signedDateTime || (envelope.status === 'completed' ? envelope.statusDateTime : null);
         return res.json({
           success: true,
-          status: status.status,
-          signers: status.signers?.map(s => ({
-            email: s.info?.email,
-            status: s.status,
-            signedAt: s.signed_at
-          })),
-          signedAt: status.signed_at
+          status: statusMap[envelope.status] || envelope.status,
+          signers: (envelope.signers || []).map(s => ({ email: s.email, status: s.status, signedAt: s.signedDateTime })),
+          signedAt
         });
       }
 
       case 'download_signed': {
-        const { signatureRequestId, documentId } = data;
-        console.log('[Yousign-Devis] Téléchargement document signé:', signatureRequestId);
-
-        const docRes = await yousignApi.get(
-          `/signature_requests/${signatureRequestId}/documents/${documentId}/download`,
-          { responseType: 'arraybuffer' }
-        );
-
-        const pdfBase64 = Buffer.from(docRes.data).toString('base64');
-
-        return res.json({
-          success: true,
-          pdfBase64
-        });
+        const { signatureRequestId } = data;
+        const pdfBuffer = await docusignService.getEnvelopeDocumentCombined(signatureRequestId);
+        return res.json({ success: true, pdfBase64: pdfBuffer.toString('base64') });
       }
 
       default:
-        console.error('[Yousign-Devis] Action non reconnue:', action);
-        return res.status(400).json({
-          success: false,
-          error: `Action non reconnue: ${action}`
-        });
+        return res.status(400).json({ success: false, error: `Action non reconnue: ${action}` });
     }
   } catch (error) {
-    console.error('[Yousign-Devis] Erreur:', error.response?.data || error.message);
+    console.error('[DocuSign-Devis] Erreur:', error.response?.data || error.message);
     return res.status(500).json({
       success: false,
       error: error.response?.data?.message || error.message,
@@ -3380,29 +2972,53 @@ app.post('/create-subscription', async (req, res) => {
   }
 });
 
-// POST : endpoint webhook pour recevoir les notifications Yousign
+// POST : webhook YouSign (désactivé — signature gérée par DocuSign)
 app.post('/api/yousign/webhook', express.json(), async (req, res) => {
+  res.status(200).json({ received: true });
+});
+
+// POST : webhook DocuSign Connect — mise à jour Firestore quand une enveloppe est complétée
+// signatureDate = date réelle de signature DocuSign (signedDateTime), pas la date d'envoi du webhook
+app.post('/api/docusign/webhook', express.json(), async (req, res) => {
   try {
-    console.log('[Yousign][Webhook] Notification reçue:', req.body);
-
-    const { event, signature_request } = req.body;
-
-    if (event === 'signature_request.completed' || event === 'signature_request.expired') {
-      // Mettre à jour le statut dans Firestore
-      // Note: Vous devrez implémenter la logique pour trouver la maintenance correspondante
-      console.log('[Yousign][Webhook] Demande de signature mise à jour:', signature_request.id);
-
-      // Exemple de mise à jour (à adapter selon votre structure)
-      // const maintenanceRef = doc(db, 'maintenances', maintenanceId);
-      // await updateDoc(maintenanceRef, {
-      //   signatureStatus: event === 'signature_request.completed' ? 'signed' : 'expired',
-      //   updatedAt: new Date()
-      // });
+    console.log('[DocuSign][Webhook] Notification reçue');
+    const envelopeId = req.body.envelopeId || req.body.data?.envelopeId;
+    const status = req.body.status || req.body.data?.status;
+    if (!envelopeId) {
+      return res.status(400).json({ error: 'envelopeId manquant' });
     }
-
-    res.status(200).json({ received: true });
+    if (status === 'completed' && db) {
+      let signatureDateIso = null;
+      try {
+        const envelope = await docusignService.getEnvelopeStatus(envelopeId);
+        const signedAt = envelope.signers?.find(s => s.signedDateTime)?.signedDateTime;
+        if (signedAt) {
+          signatureDateIso = signedAt; // ISO string fournie par DocuSign (date réelle de signature)
+        }
+      } catch (e) {
+        console.warn('[DocuSign][Webhook] Impossible de récupérer signedDateTime, utilisation date courante:', e.message);
+      }
+      const maintenancesRef = collection(db, 'maintenances');
+      const q = query(maintenancesRef, where('yousignRequestId', '==', envelopeId));
+      const snapshot = await getDocs(q);
+      if (!snapshot.empty) {
+        const maintenanceRef = doc(db, 'maintenances', snapshot.docs[0].id);
+        const updatePayload = {
+          signatureStatus: 'signed',
+          updatedAt: new Date().toISOString()
+        };
+        if (signatureDateIso) {
+          updatePayload.signatureDate = signatureDateIso;
+        } else {
+          updatePayload.signatureDate = new Date().toISOString().split('T')[0];
+        }
+        await updateDoc(maintenanceRef, updatePayload);
+        console.log('[DocuSign][Webhook] Maintenance mise à jour:', snapshot.docs[0].id, 'signatureDate:', updatePayload.signatureDate);
+      }
+    }
+    res.status(200).send('OK');
   } catch (error) {
-    console.error('[Yousign][Webhook] Erreur:', error);
+    console.error('[DocuSign][Webhook] Erreur:', error);
     res.status(500).json({ error: 'Erreur webhook' });
   }
 });
@@ -4042,73 +3658,50 @@ async function notifyFrontendMandateExpired(mandateId) {
   }
 }
 
-// GET : récupérer le statut d'une signature YouSign
+// GET : statut d'une signature (DocuSign — même URL pour compatibilité frontend)
 app.get('/api/yousign/status/:requestId', async (req, res) => {
   try {
+    if (!docusignService.isConfigured()) {
+      return res.status(503).json({ error: 'DocuSign non configuré' });
+    }
     const { requestId } = req.params;
-    console.log('[Yousign] Vérification du statut de la signature:', requestId);
-    console.log('[Yousign] Variables d\'environnement:', {
-      YOUSIGN_API_KEY: process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE',
-      YOUSIGN_API_URL: process.env.YOUSIGN_API_URL,
-      NODE_ENV: process.env.NODE_ENV
+    const envelope = await docusignService.getEnvelopeStatus(requestId);
+    const statusMap = { completed: 'signed', declined: 'declined', voided: 'expired', sent: 'pending', delivered: 'pending', signed: 'pending' };
+    const frontStatus = statusMap[envelope.status] || envelope.status;
+    const signedAt = envelope.signers?.find(s => s.signedDateTime)?.signedDateTime || (envelope.status === 'completed' ? envelope.statusDateTime : null);
+    res.json({
+      data: {
+        id: envelope.envelopeId,
+        status: frontStatus,
+        signed_at: signedAt,
+        declined_at: envelope.status === 'declined' ? envelope.statusDateTime : null,
+        expired_at: envelope.status === 'voided' ? envelope.statusDateTime : null,
+        created_at: envelope.statusDateTime,
+        updated_at: envelope.statusDateTime
+      },
+      signers: (envelope.signers || []).map(s => ({
+        id: s.id,
+        email: s.email,
+        status: s.status === 'completed' ? 'signed' : s.status,
+        signed_at: s.signedDateTime,
+        declined_at: null
+      }))
     });
-
-    if (!process.env.YOUSIGN_API_KEY) {
-      console.log('[Yousign] ERREUR: YOUSIGN_API_KEY manquante');
-      return res.status(500).json({
-        error: 'YOUSIGN_API_KEY manquant'
+  } catch (error) {
+    console.error('[DocuSign] Erreur statut:', error.response?.data || error.message);
+    
+    // ✅ Gestion erreur DocuSign : limite de polling horaire dépassée
+    if (error.errorCode === 'HOURLY_ENVELOPE_POLLING_LIMIT_EXCEEDED' || 
+        error.response?.data?.errorCode === 'HOURLY_ENVELOPE_POLLING_LIMIT_EXCEEDED') {
+      return res.status(429).json({
+        errorCode: 'HOURLY_ENVELOPE_POLLING_LIMIT_EXCEEDED',
+        message: error.message || error.response?.data?.message || 'Limite de polling horaire dépassée (250 appels/heure)',
+        data: { status: 'pending' } // Retourner un statut par défaut
       });
     }
-
-    // Appel à l'API YouSign officielle
-    console.log('[Yousign] Appel API YouSign avec clé:', process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE');
-    // Utiliser YOUSIGN_API_URL normalisé (déjà avec /v3) et signature_requests avec underscore
-    const apiUrl = `${YOUSIGN_API_URL}/signature_requests/${requestId}`;
-    console.log('[Yousign] URL appelée:', apiUrl);
-
-    const response = await axios.get(apiUrl, {
-      headers: {
-        'Authorization': `Bearer ${process.env.YOUSIGN_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const signatureRequest = response.data;
-    console.log('[Yousign] Statut récupéré:', signatureRequest.status);
-
-    // Formater la réponse pour le frontend
-    const formattedResponse = {
-      data: {
-        id: signatureRequest.id,
-        status: signatureRequest.status,
-        signed_at: signatureRequest.signed_at,
-        declined_at: signatureRequest.declined_at,
-        expired_at: signatureRequest.expired_at,
-        created_at: signatureRequest.created_at,
-        updated_at: signatureRequest.updated_at
-      },
-      signers: signatureRequest.signers?.map(signer => ({
-        id: signer.id,
-        email: signer.email,
-        status: signer.status,
-        signed_at: signer.signed_at,
-        declined_at: signer.declined_at
-      })) || []
-    };
-
-    res.json(formattedResponse);
-
-  } catch (error) {
-    console.error('[Yousign] Erreur lors de la récupération du statut:', error.response?.data || error.message);
-
-    if (error.response?.status === 404) {
-      return res.status(404).json({ error: 'Demande de signature non trouvée' });
-    }
-
-    res.status(500).json({
-      error: 'Erreur lors de la récupération du statut de signature',
-      details: error.response?.data || error.message
-    });
+    
+    if (error.response?.status === 404) return res.status(404).json({ error: 'Demande de signature non trouvée' });
+    res.status(500).json({ error: 'Erreur récupération statut', details: error.response?.data?.message || error.message });
   }
 });
 
@@ -4278,72 +3871,21 @@ app.patch('/api/maintenance/:id/signature', async (req, res) => {
   }
 });
 
-// GET : télécharger un contrat signé depuis YouSign
+// GET : télécharger un contrat signé (DocuSign)
 app.get('/api/yousign/download/:requestId', async (req, res) => {
   try {
+    if (!docusignService.isConfigured()) {
+      return res.status(503).json({ error: 'DocuSign non configuré' });
+    }
     const { requestId } = req.params;
-    console.log('[Yousign] Téléchargement du contrat signé:', requestId);
-    console.log('[Yousign] Variables d\'environnement (download):', {
-      YOUSIGN_API_KEY: process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE',
-      YOUSIGN_API_URL: process.env.YOUSIGN_API_URL,
-      NODE_ENV: process.env.NODE_ENV
-    });
-
-    if (!process.env.YOUSIGN_API_KEY) {
-      console.log('[Yousign] ERREUR: YOUSIGN_API_KEY manquante (download)');
-      return res.status(500).json({
-        error: 'YOUSIGN_API_KEY manquant'
-      });
-    }
-
-    // Récupérer le document signé depuis YouSign
-    console.log('[Yousign] Appel API YouSign documents avec clé:', process.env.YOUSIGN_API_KEY ? 'PRÉSENTE' : 'MANQUANTE');
-    // Utiliser YOUSIGN_API_URL normalisé (déjà avec /v3) et signature_requests avec underscore
-    const documentsUrl = `${YOUSIGN_API_URL}/signature_requests/${requestId}/documents`;
-    console.log('[Yousign] URL documents appelée:', documentsUrl);
-
-    const response = await axios.get(documentsUrl, {
-      headers: {
-        'Authorization': `Bearer ${process.env.YOUSIGN_API_KEY}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (!response.data || !response.data.length) {
-      return res.status(404).json({ error: 'Aucun document trouvé pour cette signature' });
-    }
-
-    // Récupérer le premier document (normalement il n'y en a qu'un)
-    const document = response.data[0];
-
-    // Télécharger le fichier signé - utiliser la structure correcte de l'API YouSign
-    const downloadUrl = `${YOUSIGN_API_URL}/signature_requests/${requestId}/documents/${document.id}/download`;
-    console.log('[Yousign] URL download appelée:', downloadUrl);
-    const fileResponse = await axios.get(downloadUrl, {
-      headers: {
-        'Authorization': `Bearer ${process.env.YOUSIGN_API_KEY}`
-      },
-      responseType: 'stream'
-    });
-
-    // Configurer les headers pour le téléchargement
+    const pdfBuffer = await docusignService.getEnvelopeDocumentCombined(requestId);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="Contrat_Signe_${requestId}.pdf"`);
-
-    // Streamer le fichier vers la réponse
-    fileResponse.data.pipe(res);
-
+    res.send(pdfBuffer);
   } catch (error) {
-    console.error('[Yousign] Erreur lors du téléchargement:', error.response?.data || error.message);
-
-    if (error.response?.status === 404) {
-      return res.status(404).json({ error: 'Document signé non trouvé' });
-    }
-
-    res.status(500).json({
-      error: 'Erreur lors du téléchargement du contrat signé',
-      details: error.response?.data || error.message
-    });
+    console.error('[DocuSign] Erreur download:', error.response?.data || error.message);
+    if (error.response?.status === 404) return res.status(404).json({ error: 'Document signé non trouvé' });
+    res.status(500).json({ error: 'Erreur téléchargement contrat', details: error.response?.data?.message || error.message });
   }
 });
 

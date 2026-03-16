@@ -15,6 +15,7 @@
     "firebase": "^12.6.0",
     "firebase-admin": "^11.11.0",
     "gocardless-nodejs": "^5.2.0",
+    "jsonwebtoken": "^9.0.3",
     "nodemailer": "^7.0.5",
     "soap": "^1.1.12"
   },
