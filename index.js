@@ -1,25 +1,30 @@
-// Chargement forcé du fichier .env
+// Chargement optionnel du fichier .env (local) — sur Render / CI il n’y a pas de .env : tout vient de process.env
 const path = require('path');
-const result = require('dotenv').config({ path: path.join(__dirname, '.env') });
-
-if (result.error) {
-  console.error('❌ Erreur lors du chargement du fichier .env:', result.error);
-} else {
-  console.log('✅ Fichier .env chargé avec succès');
-  console.log('🔑 Variables d\'environnement chargées:', {
-    DOCUSIGN_INTEGRATION_KEY: process.env.DOCUSIGN_INTEGRATION_KEY ? 'PRÉSENTE' : 'MANQUANTE',
-    DOCUSIGN_USER_ID: process.env.DOCUSIGN_USER_ID ? 'PRÉSENTE' : 'MANQUANTE',
-    DOCUSIGN_ACCOUNT_ID: process.env.DOCUSIGN_ACCOUNT_ID ? 'PRÉSENTE' : 'MANQUANTE',
-    DOCUSIGN_PRIVATE_KEY: process.env.DOCUSIGN_PRIVATE_KEY ? 'PRÉSENTE' : 'MANQUANTE',
-    SUMUP_CLIENT_ID: process.env.SUMUP_CLIENT_ID ? 'PRÉSENTE' : 'MANQUANTE',
-    SUMUP_CLIENT_SECRET: process.env.SUMUP_CLIENT_SECRET ? 'PRÉSENTE' : 'MANQUANTE',
-    SUMUP_MERCHANT_CODE: process.env.SUMUP_MERCHANT_CODE || 'MANQUANT',
-    PORT: process.env.PORT,
-    NODE_ENV: process.env.NODE_ENV
-  });
-}
-const express = require('express');
 const fs = require('fs');
+const envPath = path.join(__dirname, '.env');
+if (fs.existsSync(envPath)) {
+  const result = require('dotenv').config({ path: envPath });
+  if (result.error) {
+    console.error('❌ Erreur lors du chargement du fichier .env:', result.error);
+  } else {
+    console.log('✅ Fichier .env chargé:', envPath);
+  }
+} else {
+  console.log('ℹ️ Fichier .env absent — variables depuis process.env uniquement (normal sur Render).');
+}
+console.log('🔑 Synthèse variables:', {
+  DOCUSIGN_INTEGRATION_KEY: process.env.DOCUSIGN_INTEGRATION_KEY ? 'PRÉSENTE' : 'MANQUANTE',
+  DOCUSIGN_USER_ID: process.env.DOCUSIGN_USER_ID ? 'PRÉSENTE' : 'MANQUANTE',
+  DOCUSIGN_ACCOUNT_ID: process.env.DOCUSIGN_ACCOUNT_ID ? 'PRÉSENTE' : 'MANQUANTE',
+  DOCUSIGN_PRIVATE_KEY: process.env.DOCUSIGN_PRIVATE_KEY ? 'PRÉSENTE' : 'MANQUANTE',
+  SUMUP_CLIENT_ID: process.env.SUMUP_CLIENT_ID ? 'PRÉSENTE' : 'MANQUANTE',
+  SUMUP_CLIENT_SECRET: process.env.SUMUP_CLIENT_SECRET ? 'PRÉSENTE' : 'MANQUANTE',
+  SUMUP_MERCHANT_CODE: process.env.SUMUP_MERCHANT_CODE || 'MANQUANT',
+  FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID ? 'PRÉSENT' : 'MANQUANT',
+  PORT: process.env.PORT,
+  NODE_ENV: process.env.NODE_ENV
+});
+const express = require('express');
 const FormData = require('form-data');
 const axios = require('axios');
 const cors = require('cors');
