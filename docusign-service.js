@@ -42,6 +42,19 @@ async function getAccessToken() {
   }
 
   const privateKey = getPrivateKey();
+  // DEBUG TEMPORAIRE POUR DIAGNOSTIC CLE / JWT
+  if (privateKey) {
+    const start = privateKey.substring(0, 80);
+    const end = privateKey.substring(privateKey.length - 80);
+    console.log('[DocuSign][DEBUG] Clé privée - début:', JSON.stringify(start));
+    console.log('[DocuSign][DEBUG] Clé privée - fin:', JSON.stringify(end));
+    console.log('[DocuSign][DEBUG] Contient vrais newlines:', privateKey.includes('\n'));
+    console.log('[DocuSign][DEBUG] Nombre de lignes:', privateKey.split('\n').length);
+  } else {
+    console.log('[DocuSign][DEBUG] Aucune clé privée chargée depuis DOCUSIGN_PRIVATE_KEY');
+  }
+  // FIN DEBUG TEMPORAIRE
+
   if (!privateKey) {
     throw new Error('DocuSign: DOCUSIGN_PRIVATE_KEY (clé privée RSA PEM) est requise');
   }
@@ -134,7 +147,56 @@ async function apiRequest(method, path, options = {}) {
 async function createEnvelopeFromPdfBuffer(pdfBuffer, fileName, signerEmail, signerFirstName, signerLastName, options = {}) {
   const documentBase64 = pdfBuffer.toString('base64');
   const signerName = [signerFirstName, signerLastName].filter(Boolean).join(' ') || 'Signataire';
-  const signaturePage = options.signatureBlockPage != null ? String(options.signatureBlockPage) : '1';
+  // On utilise des ancres DocuSign (anchorString) : plus besoin de calculer la page.
+  // signatureBlockPage est conservé pour compatibilité mais ignoré.
+
+  const includeSepaTabs = options.includeSepaTabs !== false;
+
+  const signHereTabs = [
+    // Document — zone "Signature client"
+    {
+      documentId: '1',
+      tabLabel: 'Signature',
+      anchorString: 'DS_SIGNATURE_CLIENT',
+      anchorUnits: 'pixels',
+      anchorXOffset: '0',
+      anchorYOffset: '0',
+      anchorMatchWholeWord: 'true',
+      anchorCaseSensitive: 'true',
+      anchorIgnoreIfNotPresent: 'false',
+    },
+  ];
+
+  if (includeSepaTabs) {
+    // SEPA (page 4) — zone date et signature du débiteur
+    signHereTabs.push({
+      documentId: '1',
+      tabLabel: 'SignatureSEPA',
+      anchorString: 'DS_SIGNATURE_SEPA',
+      anchorUnits: 'pixels',
+      anchorXOffset: '0',
+      anchorYOffset: '0',
+      anchorMatchWholeWord: 'true',
+      anchorCaseSensitive: 'true',
+      anchorIgnoreIfNotPresent: 'false',
+    });
+  }
+
+  // Rétractation (page 5) — formulaire légal ; l’ancre vient du PDF généré côté front
+  signHereTabs.push({
+    documentId: '1',
+    tabLabel: 'SignatureRetractation',
+    anchorString: 'DS_SIGNATURE_RETRACTATION',
+    anchorUnits: 'pixels',
+    anchorXOffset: '0',
+    anchorYOffset: '0',
+    anchorMatchWholeWord: 'true',
+    anchorCaseSensitive: 'true',
+    anchorIgnoreIfNotPresent: 'true',
+  });
+
+  // Pas d’onglets « Date signée » : le format affiché suit le compte DocuSign (souvent US) et l’API
+  // n’accepte pas un motif JJ/MM/AAAA fiable. La date « Le : » est imprimée en JJ/MM/AAAA dans le PDF.
 
   const envelopeDefinition = {
     emailSubject: options.emailSubject || 'Document à signer',
@@ -153,19 +215,11 @@ async function createEnvelopeFromPdfBuffer(pdfBuffer, fileName, signerEmail, sig
           email: signerEmail,
           name: signerName,
           recipientId: '1',
+          emailNotification: {
+            supportedLanguage: 'fr',
+          },
           tabs: {
-            signHereTabs: [
-              // Contrat — zone "Signature client" (page 1 ou 2 selon signatureBlockPage)
-              { documentId: '1', pageNumber: signaturePage, xPosition: '320', yPosition: '660', tabLabel: 'Signature' },
-              // Page 3 — zone "Date et Signature du Débiteur" (SEPA)
-              { documentId: '1', pageNumber: '3', xPosition: '60', yPosition: '520', tabLabel: 'SignaturePage3' }
-            ],
-            dateSignedTabs: [
-              // Contrat — "Le ..." (date, même page que la signature)
-              { documentId: '1', pageNumber: signaturePage, xPosition: '320', yPosition: '627' },
-              // Page 3 — "Le :" (date SEPA)
-              { documentId: '1', pageNumber: '3', xPosition: '50', yPosition: '498' }
-            ]
+            signHereTabs,
           }
         }
       ]

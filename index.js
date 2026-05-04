@@ -34,9 +34,80 @@ const sumupService = require('./sumup-service');
 // Service DocuSign (signature électronique - remplace YouSign)
 const docusignService = require('./docusign-service');
 
-// Imports Firestore pour la synchronisation YouSign
-const { initializeApp } = require('firebase/app');
-const { getFirestore, doc, updateDoc, collection, query, where, getDocs, getDoc } = require('firebase/firestore');
+// Firestore Admin (service account) — bypass Security Rules
+const admin = require('firebase-admin');
+
+// Mini-adapter pour conserver les appels style "firebase/firestore"
+// (doc, collection, query, where, getDoc, getDocs, setDoc, updateDoc)
+function collection(db, name) {
+  return db.collection(name);
+}
+
+function doc(refOrDb, colName, id) {
+  // doc(db,'collection','id')
+  if (refOrDb && typeof refOrDb.collection === 'function' && typeof colName === 'string' && typeof id === 'string') {
+    return refOrDb.collection(colName).doc(id);
+  }
+  // doc(collection(db,'x')) -> auto id
+  if (refOrDb && typeof refOrDb.doc === 'function' && colName === undefined && id === undefined) {
+    return refOrDb.doc();
+  }
+  throw new Error('doc(): arguments invalides');
+}
+
+function where(field, op, value) {
+  return { field, op, value };
+}
+
+function query(colRef, ...clauses) {
+  let q = colRef;
+  for (const c of clauses) {
+    if (!c) continue;
+    if (typeof c === 'object' && 'field' in c && 'op' in c) {
+      q = q.where(c.field, c.op, c.value);
+    }
+  }
+  return q;
+}
+
+function wrapDocSnapshot(snap) {
+  if (!snap) return snap;
+  return {
+    id: snap.id,
+    ref: snap.ref,
+    exists: () => !!snap.exists,
+    data: () => snap.data(),
+    get: (fieldPath) => snap.get(fieldPath),
+  };
+}
+
+function wrapQuerySnapshot(snap) {
+  if (!snap) return snap;
+  return {
+    empty: snap.empty,
+    size: snap.size,
+    docs: Array.isArray(snap.docs) ? snap.docs.map(wrapDocSnapshot) : [],
+    forEach: (cb) => snap.forEach((d) => cb(wrapDocSnapshot(d))),
+  };
+}
+
+async function getDocs(q) {
+  const snap = await q.get();
+  return wrapQuerySnapshot(snap);
+}
+
+async function getDoc(docRef) {
+  const snap = await docRef.get();
+  return wrapDocSnapshot(snap);
+}
+
+async function setDoc(docRef, data) {
+  await docRef.set(data);
+}
+
+async function updateDoc(docRef, data) {
+  await docRef.update(data);
+}
 
 const app = express();
 // Augmenter la limite de taille pour permettre l'envoi de PDF en base64 (jusqu'à 50MB)
@@ -54,6 +125,16 @@ const allowedOrigins = [
   'http://localhost:4173'   // Fallback pour développement
 ];
 
+function isAllowedLanDevOrigin(origin) {
+  if (!origin) return false;
+  // Autoriser les origins LAN sur port Vite en dev (ex: http://192.168.8.157:5173)
+  // Activable via ALLOW_LAN_ORIGINS=true (par défaut true en dev).
+  const allowLan =
+    String(process.env.ALLOW_LAN_ORIGINS ?? (process.env.NODE_ENV ? 'false' : 'true')).toLowerCase() === 'true';
+  if (!allowLan) return false;
+  return /^http:\/\/(192\.168|10|172\.(1[6-9]|2\d|3[0-1]))\.\d{1,3}\.\d{1,3}:(5173|4173)$/.test(origin);
+}
+
 app.use(cors({
   origin: function (origin, callback) {
     // Log pour debug CORS
@@ -66,7 +147,7 @@ app.use(cors({
       return callback(null, true);
     }
 
-    if (allowedOrigins.includes(origin)) {
+    if (allowedOrigins.includes(origin) || isAllowedLanDevOrigin(origin)) {
       console.log(`[CORS] Origin autorisé: ${origin}`);
       callback(null, true);
     } else {
@@ -185,31 +266,171 @@ const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || 'service_wl6kjuo';
 const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID || 'template_nfsa5wv';
 const EMAILJS_USER_ID = process.env.EMAILJS_USER_ID || '9DbPDdjUGFwv3WVZ0';
 
-// Configuration Firebase pour la synchronisation YouSign
-const firebaseConfig = {
-  apiKey: process.env.VITE_FIREBASE_API_KEY || process.env.FIREBASE_API_KEY,
-  authDomain: process.env.VITE_FIREBASE_AUTH_DOMAIN || process.env.FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.VITE_FIREBASE_PROJECT_ID || process.env.FIREBASE_PROJECT_ID,
-  storageBucket: process.env.VITE_FIREBASE_STORAGE_BUCKET || process.env.FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.VITE_FIREBASE_MESSAGING_SENDER_ID || process.env.FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.VITE_FIREBASE_APP_ID || process.env.FIREBASE_APP_ID
-};
+// Email de bienvenue après signature (peut réutiliser les IDs par défaut)
+const EMAILJS_WELCOME_SERVICE_ID = process.env.EMAILJS_WELCOME_SERVICE_ID || EMAILJS_SERVICE_ID;
+const EMAILJS_WELCOME_TEMPLATE_ID = process.env.EMAILJS_WELCOME_TEMPLATE_ID || EMAILJS_TEMPLATE_ID;
+const EMAILJS_WELCOME_USER_ID = process.env.EMAILJS_WELCOME_USER_ID || EMAILJS_USER_ID;
+// Private key / access token (EmailJS "Use Private Key" mode)
+const EMAILJS_WELCOME_PRIVATE_KEY =
+  process.env.EMAILJS_WELCOME_PRIVATE_KEY || process.env.EMAILJS_PRIVATE_KEY || '';
 
-// Initialiser Firebase seulement si les variables requises sont présentes
-let db = null;
-if (firebaseConfig.apiKey && firebaseConfig.projectId) {
-  try {
-    const firebaseApp = initializeApp(firebaseConfig);
-    db = getFirestore(firebaseApp);
-    console.log('✅ Firebase initialisé avec succès');
-  } catch (error) {
-    console.error('❌ Erreur initialisation Firebase:', error.message);
+async function sendWelcomeEmailViaEmailJs(args) {
+  const {
+    toEmail,
+    clientName,
+    contractNumber,
+    maintenanceId,
+    contractId,
+    // Pour template welcome : date d'activation (souvent date de signature)
+    activationDate,
+    signatureDate,
+    paymentMethod,
+    formulaName,
+    equipments,
+    monthlyAmount,
+    hotlinePhone,
+    supportEmail,
+  } = args || {};
+
+  if (!toEmail || typeof toEmail !== 'string' || !toEmail.includes('@')) {
+    throw new Error('EmailJS welcome: toEmail manquant ou invalide');
   }
-} else {
-  console.warn('⚠️  Firebase non configuré - Variables manquantes:', {
-    apiKey: !!firebaseConfig.apiKey,
-    projectId: !!firebaseConfig.projectId
+
+  if (!EMAILJS_WELCOME_SERVICE_ID || !EMAILJS_WELCOME_TEMPLATE_ID || !EMAILJS_WELCOME_USER_ID) {
+    throw new Error('EmailJS welcome: variables d’environnement manquantes (service/template/user)');
+  }
+
+  const frontendUrl = process.env.FRONTEND_URL || process.env.PUBLIC_URL || process.env.ADMIN_URL || '';
+  const portalUrl = frontendUrl ? `${frontendUrl.replace(/\/$/, '')}/client-portal` : '';
+
+  const resolvedActivationDate = (activationDate || signatureDate || '').toString();
+  const resolvedHotline = (hotlinePhone || '01 81 72 39 59').toString();
+  const resolvedSupport = (supportEmail || 'sav@labelenergie.fr').toString();
+  const resolvedEquipments = Array.isArray(equipments) ? equipments.join(', ') : (equipments || '').toString();
+  const resolvedMonthly =
+    typeof monthlyAmount === 'number'
+      ? `${monthlyAmount.toFixed(2).replace('.', ',')} €`
+      : (monthlyAmount || '').toString();
+
+  const templateParams = {
+    to_email: toEmail.trim(),
+    client_name: (clientName || '').toString(),
+    // Champs attendus par l'email BIENVENUE — ACTIVATION DE VOS SERVICES
+    formula_name: (formulaName || '').toString(),
+    activation_date: resolvedActivationDate,
+    equipments: resolvedEquipments,
+    monthly_amount: resolvedMonthly,
+    hotline_phone: resolvedHotline,
+    support_email: resolvedSupport,
+
+    contract_number: (contractNumber || '').toString(),
+    maintenance_id: (maintenanceId || '').toString(),
+    contract_id: (contractId || '').toString(),
+    signature_date: (signatureDate || '').toString(),
+    payment_method: (paymentMethod || '').toString(),
+    portal_url: portalUrl,
+    // Variantes fréquentes selon templates EmailJS
+    email: toEmail.trim(),
+    recipient_email: toEmail.trim(),
+  };
+
+  // EmailJS REST API (côté serveur)
+  const startedAt = Date.now();
+  console.log('[EmailJS][Welcome] → send', {
+    serviceId: EMAILJS_WELCOME_SERVICE_ID,
+    templateId: EMAILJS_WELCOME_TEMPLATE_ID,
+    to: toEmail,
+    contractNumber,
+    maintenanceId,
+    usingPrivateKey: !!EMAILJS_WELCOME_PRIVATE_KEY,
   });
+
+  const payload = {
+    service_id: EMAILJS_WELCOME_SERVICE_ID,
+    template_id: EMAILJS_WELCOME_TEMPLATE_ID,
+    // Le user_id (public key) fonctionne en mode navigateur.
+    // En mode serveur + "Use Private Key", on ajoute accessToken.
+    user_id: EMAILJS_WELCOME_USER_ID,
+    ...(EMAILJS_WELCOME_PRIVATE_KEY ? { accessToken: EMAILJS_WELCOME_PRIVATE_KEY } : {}),
+    template_params: templateParams,
+  };
+
+  const response = await axios.post(
+    'https://api.emailjs.com/api/v1.0/email/send',
+    payload,
+    {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 15000,
+    }
+  );
+
+  console.log('[EmailJS][Welcome] ✅ sent', { ms: Date.now() - startedAt, status: response.status });
+}
+
+// Configuration Firebase pour la synchronisation YouSign
+let db = null;
+try {
+  // Mode sélectionné par env
+  // - FIREBASE_USE_SERVICE_ACCOUNT=true|false (default: true)
+  // - FIREBASE_SERVICE_ACCOUNT_PATH=... (optional)
+  // - FIREBASE_SERVICE_ACCOUNT_JSON=... (optional, JSON string)
+  // - GOOGLE_APPLICATION_CREDENTIALS=... (ADC)
+  const useServiceAccount = String(process.env.FIREBASE_USE_SERVICE_ACCOUNT ?? 'true').toLowerCase() !== 'false';
+  const serviceAccountPath =
+    process.env.FIREBASE_SERVICE_ACCOUNT_PATH || path.join(__dirname, 'serviceAccountKey.json');
+
+  if (useServiceAccount) {
+    let serviceAccount = null;
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+      try {
+        serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+      } catch (e) {
+        throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON invalide (JSON parse error)');
+      }
+    } else if (fs.existsSync(serviceAccountPath)) {
+      serviceAccount = require(serviceAccountPath);
+    }
+
+    if (serviceAccount) {
+      if (!admin.apps.length) {
+        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+      }
+      db = admin.firestore();
+      console.log('✅ Firebase Admin initialisé (service account)');
+      console.log('[Firebase Admin] projectId:', serviceAccount.project_id || serviceAccount.projectId || '(unknown)');
+    } else {
+      // Pas de fichier/JSON → fallback ADC
+      if (!admin.apps.length) admin.initializeApp();
+      db = admin.firestore();
+      console.log('✅ Firebase Admin initialisé (ADC / variables d’environnement)');
+    }
+  } else {
+    // Mode "env only": on n'utilise PAS le fichier serviceAccountKey.json local.
+    // On initialise explicitement avec le JSON pointé par GOOGLE_APPLICATION_CREDENTIALS si présent,
+    // sinon on tente ADC classique.
+    const adcPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    if (adcPath && fs.existsSync(adcPath)) {
+      const sa = require(adcPath);
+      if (!admin.apps.length) {
+        admin.initializeApp({ credential: admin.credential.cert(sa) });
+      }
+      db = admin.firestore();
+      console.log('✅ Firebase Admin initialisé (GOOGLE_APPLICATION_CREDENTIALS)');
+      console.log('[Firebase Admin] projectId:', sa.project_id || sa.projectId || '(unknown)');
+    } else {
+      if (!admin.apps.length) admin.initializeApp();
+      db = admin.firestore();
+      console.log('✅ Firebase Admin initialisé (ADC forcé par FIREBASE_USE_SERVICE_ACCOUNT=false)');
+      if (!adcPath) {
+        console.warn('[Firebase Admin] GOOGLE_APPLICATION_CREDENTIALS manquant (ADC peut échouer en local)');
+      } else {
+        console.warn('[Firebase Admin] GOOGLE_APPLICATION_CREDENTIALS pointe vers un fichier introuvable:', adcPath);
+      }
+    }
+  }
+} catch (error) {
+  console.error('❌ Erreur initialisation Firebase Admin:', error.message || error);
+  db = null;
 }
 
 // Configuration des webhooks GoCardless
@@ -690,9 +911,19 @@ app.post('/create-maintenance-subscription', async (req, res) => {
 
     // day_of_month : 1-28 ou -1 (dernier jour). Obligatoire pour monthly/yearly.
     // Sans start_date, GoCardless utilise next_possible_charge_date du mandat (doc GoCardless).
-    const dayOfMonth = typeof req.body.day_of_month === 'number' && req.body.day_of_month >= 1 && req.body.day_of_month <= 28
-      ? req.body.day_of_month
-      : (req.body.day_of_month === -1 ? -1 : 1);
+    // ⚠️ Robustesse: certaines sources (Firestore/JSON) envoient "14" (string) → on normalise.
+    const rawDayOfMonth = req.body.day_of_month;
+    const parsedDayOfMonth =
+      typeof rawDayOfMonth === 'number'
+        ? rawDayOfMonth
+        : (typeof rawDayOfMonth === 'string' && rawDayOfMonth.trim()
+          ? Number(rawDayOfMonth.trim())
+          : NaN);
+
+    const dayOfMonth =
+      Number.isFinite(parsedDayOfMonth) && parsedDayOfMonth >= 1 && parsedDayOfMonth <= 28
+        ? parsedDayOfMonth
+        : (parsedDayOfMonth === -1 ? -1 : 1);
 
     // Doc GoCardless : amount et day_of_month en string dans les exemples
     const amountMinor = String(Math.round(amount * 100));
@@ -797,8 +1028,8 @@ app.post('/api/yousign/signature-request', async (req, res) => {
     if (!docusignService.isConfigured()) {
       return res.status(503).json({ error: 'DocuSign non configuré (variables d\'environnement manquantes)' });
     }
-    console.log('[DocuSign] Requête signature reçue:', { pdfUrl: !!req.body.pdfUrl, signerEmail: req.body.signerEmail, signatureBlockPage: req.body.signatureBlockPage });
-    const { pdfUrl, signerFirstName, signerLastName, signerEmail, signatureBlockPage } = req.body;
+    console.log('[DocuSign] Requête signature reçue:', { pdfUrl: !!req.body.pdfUrl, signerEmail: req.body.signerEmail });
+    const { pdfUrl, signerFirstName, signerLastName, signerEmail } = req.body;
     if (!pdfUrl || !signerEmail) {
       return res.status(400).json({ error: 'pdfUrl et signerEmail sont requis' });
     }
@@ -810,7 +1041,6 @@ app.post('/api/yousign/signature-request', async (req, res) => {
       {
         emailSubject: 'Contrat à signer',
         emailBody: 'Veuillez signer le document ci-joint.',
-        signatureBlockPage: signatureBlockPage != null ? Number(signatureBlockPage) : 1
       }
     );
     res.json({
@@ -931,7 +1161,11 @@ app.post('/api/yousign-devis', async (req, res) => {
           signer.email,
           signer.firstName || '',
           signer.lastName || '',
-          { emailSubject: `Devis SAV ${devisInfo.number} à signer` }
+          {
+            emailSubject: `Devis SAV ${devisInfo.number} à signer`,
+            // Un devis SAV n'inclut pas le mandat SEPA (contrairement au contrat maintenance).
+            includeSepaTabs: false,
+          }
         );
         let sumupPaymentUrl = null;
         let sumupCheckoutId = null;
@@ -2324,6 +2558,57 @@ app.get('/api/gocardless/subscription-status', async (req, res) => {
   }
 });
 
+// GET : liste des paiements GoCardless pour un abonnement (portail / CRM)
+app.get('/api/gocardless/payments-by-subscription', async (req, res) => {
+  try {
+    const subscriptionId = req.query.subscriptionId;
+    const limitRaw = req.query.limit;
+    const limit = Math.max(1, Math.min(200, Number(limitRaw ?? 50) || 50));
+
+    if (!subscriptionId || typeof subscriptionId !== 'string') {
+      return res.status(400).json({ error: 'Paramètre subscriptionId requis (query)' });
+    }
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ error: 'GOCARDLESS_ACCESS_TOKEN manquant' });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const headers = {
+      'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+      'GoCardless-Version': '2015-07-06',
+      'Content-Type': 'application/json'
+    };
+
+    // Tentative 1: filtre API si supporté
+    try {
+      const response = await axios.get(`${apiUrl}/payments`, {
+        headers,
+        params: { subscription: subscriptionId, limit }
+      });
+      const payments = response.data.payments || [];
+      return res.json({ payments });
+    } catch (e) {
+      // fallback: liste + filtre côté serveur (plus robuste selon versions GoCardless)
+      const listRes = await axios.get(`${apiUrl}/payments`, {
+        headers,
+        params: { limit: Math.max(limit, 100) }
+      });
+      const allPayments = listRes.data.payments || [];
+      const filtered = allPayments.filter((p) => p?.links?.subscription === subscriptionId).slice(0, limit);
+      return res.json({ payments: filtered });
+    }
+  } catch (error) {
+    const status = error.response?.status;
+    const data = error.response?.data;
+    console.error('[GoCardless] Erreur récupération paiements (subscription):', data || error.message);
+    return res.status(status || 500).json({
+      error: 'Erreur lors de la récupération des paiements',
+      message: data?.error?.message || error.message,
+      details: data
+    });
+  }
+});
+
 // GET : récupérer un mandat par ID (AJOUTÉ)
 app.get('/mandates/:id', async (req, res) => {
   try {
@@ -2977,6 +3262,253 @@ app.post('/api/yousign/webhook', express.json(), async (req, res) => {
   res.status(200).json({ received: true });
 });
 
+// POST /api/portal/create-maintenance-for-contract — portail client: créer une maintenance si aucune n'existe
+app.post('/api/portal/create-maintenance-for-contract', async (req, res) => {
+  try {
+    if (!db) {
+      return res.status(500).json({ error: 'Firebase non initialisé' });
+    }
+
+    const body = req.body || {};
+    const {
+      clientId,
+      clientName,
+      signerEmail,
+      contractNumber,
+      contractStartDate,
+      contractEndDate,
+      monthlyAmount,
+      paymentDate,
+      paymentMethod,
+      equipmentName,
+      gocardlessIban,
+      gocardlessAccountHolder,
+      gocardlessAddress,
+      gocardlessPostalCode,
+      gocardlessCity,
+      gocardlessCountry
+    } = body;
+
+    const missing = [];
+    if (!clientId) missing.push('clientId');
+    if (!signerEmail) missing.push('signerEmail');
+    if (!contractNumber) missing.push('contractNumber');
+    if (!contractStartDate) missing.push('contractStartDate');
+    if (!contractEndDate) missing.push('contractEndDate');
+    if (typeof monthlyAmount !== 'number') missing.push('monthlyAmount');
+    if (typeof paymentDate !== 'number') missing.push('paymentDate');
+    if (paymentMethod !== 'gocardless' && paymentMethod !== 'manual') missing.push('paymentMethod');
+
+    if (missing.length) {
+      return res.status(400).json({ error: 'Champs requis manquants', missing });
+    }
+
+    const maintenanceRef = doc(collection(db, 'maintenances'));
+    const maintenanceId = maintenanceRef.id;
+
+    // Important : ces champs sont utilisés par les rules Storage/Firestore côté portail.
+    const maintenanceData = {
+      clientId: String(clientId),
+      clientName: String(clientName || ''),
+      clientContact: { email: String(signerEmail) },
+      signerEmail: String(signerEmail),
+
+      contractNumber: String(contractNumber),
+      equipmentName: equipmentName ? String(equipmentName) : undefined,
+
+      lastMaintenance: String(contractStartDate), // YYYY-MM-DD
+      nextMaintenance: String(contractEndDate), // YYYY-MM-DD
+
+      monthlyAmount: monthlyAmount,
+      paymentDate: paymentDate,
+      paymentMethod: paymentMethod,
+      paymentStatus: 'pending',
+
+      status: 'aprogrammer',
+      signatureStatus: 'pending',
+      gocardlessSubscriptionPending: paymentMethod === 'gocardless' && monthlyAmount > 0,
+
+      ...(paymentMethod === 'gocardless' && {
+        gocardlessIban: String(gocardlessIban || ''),
+        gocardlessAccountHolder: String(gocardlessAccountHolder || ''),
+        gocardlessAddress: String(gocardlessAddress || ''),
+        gocardlessPostalCode: String(gocardlessPostalCode || ''),
+        gocardlessCity: String(gocardlessCity || ''),
+        gocardlessCountry: String(gocardlessCountry || 'FR')
+      }),
+
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    await setDoc(maintenanceRef, maintenanceData);
+
+    console.log('[Portal][Contract] maintenance créée', { maintenanceId, clientId, signerEmail });
+    return res.json({ success: true, maintenanceId });
+  } catch (error) {
+    console.error('[Portal][Contract] Erreur create-maintenance-for-contract:', error.response?.data || error.message || error);
+    return res.status(500).json({
+      error: 'Erreur lors de la création de maintenance portail',
+      details: error.response?.data || error.message || error
+    });
+  }
+});
+
+// POST /api/portal/create-contract — portail client: créer contrat + lancer DocuSign
+app.post('/api/portal/create-contract', async (req, res) => {
+  try {
+    if (!docusignService.isConfigured()) {
+      return res.status(503).json({ error: 'DocuSign non configuré (variables d’environnement manquantes)' });
+    }
+    if (!db) {
+      return res.status(500).json({ error: 'Firebase non initialisé' });
+    }
+
+    const body = req.body || {};
+    const {
+      maintenanceId,
+      contractNumber,
+      pdfUrl,
+      signerEmail,
+      signerFirstName,
+      signerLastName,
+      equipmentName,
+      contractStartDate,
+      contractEndDate,
+      monthlyAmount,
+      paymentDate,
+      paymentMethod,
+      gocardlessIban,
+      gocardlessAccountHolder,
+      gocardlessAddress,
+      gocardlessPostalCode,
+      gocardlessCity,
+      gocardlessCountry
+    } = body;
+
+    const missing = [];
+    if (!maintenanceId) missing.push('maintenanceId');
+    if (!contractNumber) missing.push('contractNumber');
+    if (!pdfUrl) missing.push('pdfUrl');
+    if (!signerEmail) missing.push('signerEmail');
+    if (!contractStartDate) missing.push('contractStartDate');
+    if (!contractEndDate) missing.push('contractEndDate');
+    if (typeof monthlyAmount !== 'number') missing.push('monthlyAmount');
+    if (typeof paymentDate !== 'number') missing.push('paymentDate');
+    if (paymentMethod !== 'gocardless' && paymentMethod !== 'manual') missing.push('paymentMethod');
+
+    if (paymentMethod === 'gocardless') {
+      if (!gocardlessIban) missing.push('gocardlessIban');
+      if (!gocardlessAccountHolder) missing.push('gocardlessAccountHolder');
+      if (!gocardlessAddress) missing.push('gocardlessAddress');
+      if (!gocardlessPostalCode) missing.push('gocardlessPostalCode');
+      if (!gocardlessCity) missing.push('gocardlessCity');
+      if (!gocardlessCountry) missing.push('gocardlessCountry');
+    }
+
+    if (missing.length) {
+      return res.status(400).json({ error: 'Champs requis manquants', missing });
+    }
+
+    const maintenanceRef = doc(db, 'maintenances', maintenanceId);
+    console.log('[Portal][Contract] create-contract', {
+      maintenanceId,
+      contractNumber,
+      paymentMethod,
+      paymentDate,
+      monthlyAmount: typeof monthlyAmount === 'number' ? monthlyAmount : null
+    });
+    const maintenanceSnap = await getDoc(maintenanceRef);
+    if (!maintenanceSnap.exists()) {
+      return res.status(404).json({ error: 'Maintenance introuvable' });
+    }
+
+    const maintenanceData = maintenanceSnap.data() || {};
+    const clientId = maintenanceData.clientId || '';
+    const clientEmail = signerEmail;
+    const clientName = maintenanceData.clientName || '';
+
+    const contractRef = doc(collection(db, 'contracts'));
+    const contractId = contractRef.id;
+
+    // Créer l’enveloppe DocuSign à partir du PDF (le PDF contient déjà les données contractuelles)
+    const { envelopeId } = await docusignService.createEnvelopeFromPdfUrl(
+      pdfUrl,
+      signerEmail,
+      signerFirstName || '',
+      signerLastName || '',
+      {
+        emailSubject: 'Contrat à signer',
+        emailBody: 'Veuillez signer le document ci-joint.'
+      }
+    );
+    console.log('[Portal][Contract] DocuSign envelope created', { envelopeId });
+
+    // 1) Créer le document `contracts` pour que le portail puisse afficher le contrat + télécharger le PDF signé
+    await setDoc(contractRef, {
+      id: contractId,
+      maintenanceId,
+      clientId,
+      clientEmail,
+      clientName,
+      contractNumber,
+      equipmentName: equipmentName || 'Équipement',
+      pdfUrl,
+      contractStartDate: new Date(`${contractStartDate}T00:00:00`),
+      contractEndDate: new Date(`${contractEndDate}T00:00:00`),
+      paymentStatus: 'pending',
+      signatureStatus: 'pending',
+      yousignRequestId: envelopeId,
+      createdAt: new Date().toISOString()
+    });
+    try {
+      const contractSnap = await getDoc(contractRef);
+      console.log('[Portal][Contract] contract doc exists after write?', contractSnap.exists());
+    } catch (e) {
+      console.warn('[Portal][Contract] unable to read back contract doc after write:', e.message || e);
+    }
+
+    // 2) Mettre à jour la `maintenance` (webhook DocuSign mettra signatureStatus à 'signed')
+    const ibanNormalized = paymentMethod === 'gocardless' ? String(gocardlessIban).replace(/\s/g, '').toUpperCase() : '';
+    const maintenanceUpdate = {
+      contractNumber,
+      contractId,
+      paymentMethod,
+      paymentStatus: 'pending',
+      monthlyAmount,
+      paymentDate,
+      lastMaintenance: contractStartDate,
+      nextMaintenance: contractEndDate,
+
+      // Pour éviter des erreurs GoCardless quand le montant est à 0 (ex: formule VIP “sur devis”)
+      gocardlessSubscriptionPending: paymentMethod === 'gocardless' && monthlyAmount > 0,
+      ...(paymentMethod === 'gocardless' && {
+        gocardlessIban: ibanNormalized,
+        gocardlessAccountHolder: String(gocardlessAccountHolder),
+        gocardlessAddress: String(gocardlessAddress),
+        gocardlessPostalCode: String(gocardlessPostalCode),
+        gocardlessCity: String(gocardlessCity),
+        gocardlessCountry: String(gocardlessCountry)
+      }),
+
+      signerEmail,
+      yousignRequestId: envelopeId,
+      signatureStatus: 'pending',
+      updatedAt: new Date().toISOString()
+    };
+
+    await updateDoc(maintenanceRef, maintenanceUpdate);
+
+    return res.json({ success: true, contractId, yousignRequestId: envelopeId });
+  } catch (error) {
+    console.error('[Portal][Contract] Erreur:', error.response?.data || error.message || error);
+    return res.status(500).json({
+      error: 'Erreur lors de la création du contrat portail',
+      details: error.response?.data || error.message || error
+    });
+  }
+});
+
 // POST : webhook DocuSign Connect — mise à jour Firestore quand une enveloppe est complétée
 // signatureDate = date réelle de signature DocuSign (signedDateTime), pas la date d'envoi du webhook
 app.post('/api/docusign/webhook', express.json(), async (req, res) => {
@@ -2988,6 +3520,7 @@ app.post('/api/docusign/webhook', express.json(), async (req, res) => {
       return res.status(400).json({ error: 'envelopeId manquant' });
     }
     if (status === 'completed' && db) {
+      console.log('[DocuSign][Webhook] Envelope completed → start sync', { envelopeId });
       let signatureDateIso = null;
       try {
         const envelope = await docusignService.getEnvelopeStatus(envelopeId);
@@ -3001,8 +3534,48 @@ app.post('/api/docusign/webhook', express.json(), async (req, res) => {
       const maintenancesRef = collection(db, 'maintenances');
       const q = query(maintenancesRef, where('yousignRequestId', '==', envelopeId));
       const snapshot = await getDocs(q);
-      if (!snapshot.empty) {
-        const maintenanceRef = doc(db, 'maintenances', snapshot.docs[0].id);
+      let maintenanceDoc = !snapshot.empty ? snapshot.docs[0] : null;
+
+      // Fallback: si la maintenance n'a pas (encore) le yousignRequestId, tenter via `contracts`
+      if (!maintenanceDoc) {
+        try {
+          const contractsRef = collection(db, 'contracts');
+          const cq = query(contractsRef, where('yousignRequestId', '==', envelopeId));
+          const csnap = await getDocs(cq);
+          if (!csnap.empty) {
+            const c0 = csnap.docs[0];
+            const cData = c0.data() || {};
+            const mId = cData.maintenanceId;
+            const cNumber = cData.contractNumber;
+            console.log('[DocuSign][Webhook] Maintenance fallback via contract', { envelopeId, maintenanceId: mId || null, contractNumber: cNumber || null });
+
+            if (mId) {
+              const mRef = doc(db, 'maintenances', String(mId));
+              const mSnap = await getDoc(mRef);
+              if (mSnap.exists()) maintenanceDoc = mSnap;
+            }
+
+            if (!maintenanceDoc && cNumber) {
+              const mq = query(maintenancesRef, where('contractNumber', '==', String(cNumber)));
+              const msnap = await getDocs(mq);
+              if (!msnap.empty) maintenanceDoc = msnap.docs[0];
+            }
+          }
+        } catch (e) {
+          console.warn('[DocuSign][Webhook] Maintenance fallback via contract failed:', e.message || e);
+        }
+      }
+
+      if (maintenanceDoc) {
+        const maintenanceId = maintenanceDoc.id;
+        const previousMaintenanceData = maintenanceDoc.data() || {};
+        console.log('[DocuSign][Webhook] Maintenance found for envelope', {
+          maintenanceId,
+          contractNumber: previousMaintenanceData?.contractNumber,
+          signerEmail: previousMaintenanceData?.signerEmail || previousMaintenanceData?.clientContact?.email,
+          welcomeEmailSentAt: previousMaintenanceData?.welcomeEmailSentAt || null,
+        });
+        const maintenanceRef = doc(db, 'maintenances', maintenanceId);
         const updatePayload = {
           signatureStatus: 'signed',
           updatedAt: new Date().toISOString()
@@ -3013,7 +3586,135 @@ app.post('/api/docusign/webhook', express.json(), async (req, res) => {
           updatePayload.signatureDate = new Date().toISOString().split('T')[0];
         }
         await updateDoc(maintenanceRef, updatePayload);
-        console.log('[DocuSign][Webhook] Maintenance mise à jour:', snapshot.docs[0].id, 'signatureDate:', updatePayload.signatureDate);
+        console.log('[DocuSign][Webhook] Maintenance mise à jour:', maintenanceId, 'signatureDate:', updatePayload.signatureDate);
+
+        // 1) Mettre à jour les contrats côté portail (documents `contracts`)
+        let updatedContractIds = [];
+        try {
+          const contractsRef = collection(db, 'contracts');
+          const contractQuery = query(contractsRef, where('yousignRequestId', '==', envelopeId));
+          const contractSnap = await getDocs(contractQuery);
+          for (const c of contractSnap.docs) {
+            await updateDoc(doc(db, 'contracts', c.id), {
+              signatureStatus: 'signed',
+              signatureDate: updatePayload.signatureDate,
+              updatedAt: new Date().toISOString()
+            });
+            updatedContractIds.push(c.id);
+          }
+        } catch (e) {
+          console.warn('[DocuSign][Webhook] Mise à jour contracts impossible:', e.message || e);
+        }
+
+        // 1bis) Envoyer l'email de bienvenue (une seule fois, uniquement après signature)
+        try {
+          const alreadySent = !!previousMaintenanceData?.welcomeEmailSentAt;
+          const toEmail = previousMaintenanceData?.signerEmail || previousMaintenanceData?.clientContact?.email || '';
+          const clientName = previousMaintenanceData?.clientName || '';
+          const contractNumber = previousMaintenanceData?.contractNumber || '';
+          const paymentMethod = previousMaintenanceData?.paymentMethod || '';
+
+          if (!alreadySent && toEmail) {
+            console.log('[DocuSign][Webhook] Welcome email eligible → sending', { maintenanceId, toEmail, contractNumber });
+            await sendWelcomeEmailViaEmailJs({
+              toEmail,
+              clientName,
+              contractNumber,
+              maintenanceId,
+              contractId: previousMaintenanceData?.contractId || (updatedContractIds[0] || ''),
+              activationDate: updatePayload.signatureDate,
+              signatureDate: updatePayload.signatureDate,
+              paymentMethod,
+              formulaName: previousMaintenanceData?.formulaName || previousMaintenanceData?.formula?.name || '',
+              equipments: previousMaintenanceData?.equipmentNames || previousMaintenanceData?.equipmentName || '',
+              monthlyAmount: typeof previousMaintenanceData?.monthlyAmount === 'number' ? previousMaintenanceData.monthlyAmount : null,
+              hotlinePhone: '01 81 72 39 59',
+              supportEmail: 'sav@labelenergie.fr',
+            });
+
+            // Marquer comme envoyé (idempotence anti double webhook)
+            await updateDoc(maintenanceRef, {
+              welcomeEmailSentAt: new Date().toISOString(),
+              welcomeEmailStatus: 'success',
+              welcomeEmailTo: String(toEmail),
+              updatedAt: new Date().toISOString(),
+            });
+
+            // Marquer aussi côté contracts (si présents)
+            for (const cid of updatedContractIds) {
+              try {
+                await updateDoc(doc(db, 'contracts', cid), {
+                  welcomeEmailSentAt: new Date().toISOString(),
+                  welcomeEmailStatus: 'success',
+                  welcomeEmailTo: String(toEmail),
+                  updatedAt: new Date().toISOString(),
+                });
+              } catch (e2) {
+                // non bloquant
+              }
+            }
+
+            console.log('[DocuSign][Webhook] ✅ Email de bienvenue envoyé:', toEmail, 'maintenance:', maintenanceId);
+          } else {
+            console.log('[DocuSign][Webhook] Email bienvenue ignoré (déjà envoyé ou email manquant)', {
+              alreadySent,
+              hasEmail: !!toEmail,
+              maintenanceId,
+            });
+          }
+        } catch (e) {
+          console.warn('[DocuSign][Webhook] ❌ Envoi email bienvenue échoué:', e.message || e);
+          // Log non bloquant + marquage erreur (sans bloquer GoCardless)
+          try {
+            await updateDoc(maintenanceRef, {
+              welcomeEmailStatus: 'error',
+              welcomeEmailError: String(e.message || e),
+              updatedAt: new Date().toISOString(),
+            });
+          } catch (_ignored) {}
+        }
+
+        // 2) Créer automatiquement l’abonnement GoCardless après signature (si requis)
+        try {
+          const shouldCreateSubscription =
+            previousMaintenanceData?.gocardlessSubscriptionPending === true &&
+            previousMaintenanceData?.paymentMethod === 'gocardless' &&
+            previousMaintenanceData?.gocardlessIban &&
+            previousMaintenanceData?.gocardlessAccountHolder &&
+            typeof previousMaintenanceData?.monthlyAmount === 'number' &&
+            previousMaintenanceData?.monthlyAmount > 0;
+
+          if (shouldCreateSubscription) {
+            const baseUrl = `${req.protocol}://${req.get('host')}`;
+            await axios.post(`${baseUrl}/create-maintenance-subscription`, {
+              account_holder_name: previousMaintenanceData.gocardlessAccountHolder,
+              iban: previousMaintenanceData.gocardlessIban,
+              amount: previousMaintenanceData.monthlyAmount,
+              currency: 'EUR',
+              interval_unit: 'monthly',
+              interval: 1,
+              start_date: previousMaintenanceData.lastMaintenance,
+              // Certaines maintenances stockent paymentDate en string ("14") → on cast pour éviter fallback à 1.
+              day_of_month: Number(previousMaintenanceData.paymentDate) || 1,
+              metadata: {
+                contractNumber: previousMaintenanceData.contractNumber || '',
+                maintenanceId: maintenanceId,
+                clientId: previousMaintenanceData.clientId || '',
+                address: previousMaintenanceData.gocardlessAddress || '',
+                city: previousMaintenanceData.gocardlessCity || '',
+                postalCode: previousMaintenanceData.gocardlessPostalCode || '',
+                country: previousMaintenanceData.gocardlessCountry || 'FR',
+                clientEmail: previousMaintenanceData.signerEmail || previousMaintenanceData.clientContact?.email || ''
+              }
+            }, {
+              headers: { 'Content-Type': 'application/json' }
+            });
+          }
+        } catch (e) {
+          console.warn('[DocuSign][Webhook] Création abonnement GoCardless échouée:', e.message || e);
+        }
+      } else {
+        console.log('[DocuSign][Webhook] No maintenance found for envelope', { envelopeId });
       }
     }
     res.status(200).send('OK');
@@ -3669,6 +4370,125 @@ app.get('/api/yousign/status/:requestId', async (req, res) => {
     const statusMap = { completed: 'signed', declined: 'declined', voided: 'expired', sent: 'pending', delivered: 'pending', signed: 'pending' };
     const frontStatus = statusMap[envelope.status] || envelope.status;
     const signedAt = envelope.signers?.find(s => s.signedDateTime)?.signedDateTime || (envelope.status === 'completed' ? envelope.statusDateTime : null);
+    console.log('[DocuSign][Status] envelope', { requestId, envelopeStatus: envelope.status, frontStatus, signedAt: signedAt || null });
+
+    // Fallback local: si DocuSign Connect (webhook) n'est pas configuré,
+    // le front ne fera que "poller" ce endpoint. On en profite pour synchroniser Firestore
+    // et envoyer l'email de bienvenue UNE seule fois.
+    if (frontStatus === 'signed' && db) {
+      try {
+        const maintenancesRef = collection(db, 'maintenances');
+        const q = query(maintenancesRef, where('yousignRequestId', '==', requestId));
+        const snap = await getDocs(q);
+        let mDoc = !snap.empty ? snap.docs[0] : null;
+
+        // Fallback: si la maintenance n'a pas (encore) le yousignRequestId, tenter via `contracts`
+        if (!mDoc) {
+          try {
+            const contractsRef = collection(db, 'contracts');
+            const cq = query(contractsRef, where('yousignRequestId', '==', requestId));
+            const csnap = await getDocs(cq);
+            if (!csnap.empty) {
+              const c0 = csnap.docs[0];
+              const cData = c0.data() || {};
+              const mId = cData.maintenanceId;
+              const cNumber = cData.contractNumber;
+              console.log('[DocuSign][Status] Maintenance fallback via contract', { requestId, maintenanceId: mId || null, contractNumber: cNumber || null });
+
+              if (mId) {
+                const mRef = doc(db, 'maintenances', String(mId));
+                const mSnap = await getDoc(mRef);
+                if (mSnap.exists()) mDoc = mSnap;
+              }
+
+              if (!mDoc && cNumber) {
+                const mq = query(maintenancesRef, where('contractNumber', '==', String(cNumber)));
+                const msnap = await getDocs(mq);
+                if (!msnap.empty) mDoc = msnap.docs[0];
+              }
+            }
+          } catch (e) {
+            console.warn('[DocuSign][Status] Maintenance fallback via contract failed:', e.message || e);
+          }
+        }
+
+        if (mDoc) {
+          const maintenanceId = mDoc.id;
+          const mData = mDoc.data() || {};
+          const mRef = doc(db, 'maintenances', maintenanceId);
+          console.log('[DocuSign][Status] Maintenance found for signed envelope', {
+            maintenanceId,
+            contractNumber: mData?.contractNumber,
+            signerEmail: mData?.signerEmail || mData?.clientContact?.email,
+            welcomeEmailSentAt: mData?.welcomeEmailSentAt || null,
+          });
+
+          // Assurer la cohérence des champs de signature
+          const nextSigDate = signedAt || new Date().toISOString();
+          const shouldUpdateSig = mData.signatureStatus !== 'signed' || !mData.signatureDate;
+          if (shouldUpdateSig) {
+            await updateDoc(mRef, {
+              signatureStatus: 'signed',
+              signatureDate: nextSigDate,
+              updatedAt: new Date().toISOString(),
+            });
+          }
+
+          // Email bienvenue idempotent
+          if (!mData.welcomeEmailSentAt) {
+            const toEmail = mData.signerEmail || mData.clientContact?.email || '';
+            if (toEmail) {
+              console.log('[DocuSign][Status] Welcome email eligible → sending', { maintenanceId, toEmail, contractNumber: mData.contractNumber });
+              const equipments =
+                Array.isArray(mData.equipmentNames) && mData.equipmentNames.length
+                  ? mData.equipmentNames.join(', ')
+                  : (mData.equipmentName || '');
+              const monthly = typeof mData.monthlyAmount === 'number' ? mData.monthlyAmount : null;
+              const activationDate = (() => {
+                try {
+                  return new Date(nextSigDate).toLocaleDateString('fr-FR');
+                } catch {
+                  return '';
+                }
+              })();
+
+              await sendWelcomeEmailViaEmailJs({
+                toEmail,
+                clientName: mData.clientName || '',
+                contractNumber: mData.contractNumber || '',
+                maintenanceId,
+                contractId: mData.contractId || '',
+                activationDate,
+                signatureDate: activationDate,
+                paymentMethod: mData.paymentMethod || '',
+                formulaName: mData.formulaName || mData.formula?.name || '',
+                equipments,
+                monthlyAmount: monthly,
+                hotlinePhone: '01 81 72 39 59',
+                supportEmail: 'sav@labelenergie.fr',
+              });
+
+              await updateDoc(mRef, {
+                welcomeEmailSentAt: new Date().toISOString(),
+                welcomeEmailStatus: 'success',
+                welcomeEmailTo: String(toEmail),
+                updatedAt: new Date().toISOString(),
+              });
+              console.log('[DocuSign][Status] ✅ Email de bienvenue envoyé (fallback polling):', toEmail, 'maintenance:', maintenanceId);
+            } else {
+              console.log('[DocuSign][Status] Welcome email skipped (missing email)', { maintenanceId });
+            }
+          } else {
+            console.log('[DocuSign][Status] Welcome email skipped (already sent)', { maintenanceId });
+          }
+        } else {
+          console.log('[DocuSign][Status] No maintenance found for signed envelope', { requestId });
+        }
+      } catch (e) {
+        console.warn('[DocuSign][Status] Fallback sync/welcome email failed:', e.message || e);
+      }
+    }
+
     res.json({
       data: {
         id: envelope.envelopeId,
@@ -3794,6 +4614,57 @@ app.get('/api/maintenance/pending-signatures', async (req, res) => {
       error: 'Erreur lors de la récupération des maintenances',
       details: error.message
     });
+  }
+});
+
+// DEBUG (DEV) — Forcer l'envoi de l'email de bienvenue depuis une maintenanceId
+// Usage: POST /api/debug/send-welcome-email { maintenanceId: "..." }
+app.post('/api/debug/send-welcome-email', express.json(), async (req, res) => {
+  try {
+    const { maintenanceId } = req.body || {};
+    if (!maintenanceId) return res.status(400).json({ error: 'maintenanceId requis' });
+    if (!db) return res.status(503).json({ error: 'Firebase non disponible' });
+
+    const mRef = doc(db, 'maintenances', String(maintenanceId));
+    const mSnap = await getDoc(mRef);
+    if (!mSnap.exists()) return res.status(404).json({ error: 'Maintenance non trouvée', maintenanceId });
+
+    const m = { id: mSnap.id, ...(mSnap.data() || {}) };
+    const toEmail = m.signerEmail || m.clientContact?.email || '';
+    if (!toEmail) return res.status(400).json({ error: 'Email manquant sur la maintenance', maintenanceId });
+
+    const equipments = Array.isArray(m.equipmentNames) && m.equipmentNames.length ? m.equipmentNames : (m.equipmentName || '');
+    const activationDate = (() => {
+      try {
+        const d = m.signatureDate || new Date().toISOString();
+        return new Date(d).toLocaleDateString('fr-FR');
+      } catch {
+        return '';
+      }
+    })();
+
+    console.log('[DEBUG][WelcomeEmail] force send', { maintenanceId, toEmail, contractNumber: m.contractNumber || '' });
+    await sendWelcomeEmailViaEmailJs({
+      toEmail,
+      clientName: m.clientName || '',
+      contractNumber: m.contractNumber || '',
+      maintenanceId: mSnap.id,
+      contractId: m.contractId || '',
+      activationDate,
+      signatureDate: m.signatureDate || '',
+      paymentMethod: m.paymentMethod || '',
+      formulaName: m.formulaName || m.formula?.name || '',
+      equipments,
+      monthlyAmount: typeof m.monthlyAmount === 'number' ? m.monthlyAmount : null,
+      hotlinePhone: '01 81 72 39 59',
+      supportEmail: 'sav@labelenergie.fr',
+    });
+
+    res.json({ success: true, maintenanceId: mSnap.id, toEmail });
+  } catch (e) {
+    const details = e?.response?.data || e?.message || String(e);
+    console.error('[DEBUG][WelcomeEmail] failed', details);
+    res.status(500).json({ error: 'Envoi welcome email échoué', details });
   }
 });
 
