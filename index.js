@@ -374,10 +374,35 @@ try {
   // - FIREBASE_USE_SERVICE_ACCOUNT=true|false (default: true)
   // - FIREBASE_SERVICE_ACCOUNT_PATH=... (optional)
   // - FIREBASE_SERVICE_ACCOUNT_JSON=... (optional, JSON string)
+  // - Ou variables « déployeur » (Render, etc.) : FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY
   // - GOOGLE_APPLICATION_CREDENTIALS=... (ADC)
   const useServiceAccount = String(process.env.FIREBASE_USE_SERVICE_ACCOUNT ?? 'true').toLowerCase() !== 'false';
   const serviceAccountPath =
     process.env.FIREBASE_SERVICE_ACCOUNT_PATH || path.join(__dirname, 'serviceAccountKey.json');
+
+  /** Construit l’objet compte de service à partir des variables séparées (souvent sur Render sans fichier JSON). */
+  function serviceAccountFromSplitEnv() {
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+    const rawKey = process.env.FIREBASE_PRIVATE_KEY;
+    if (!projectId || !clientEmail || !rawKey) return null;
+    const privateKey = String(rawKey).includes('\\n')
+      ? String(rawKey).replace(/\\n/g, '\n')
+      : String(rawKey);
+    const sa = {
+      type: 'service_account',
+      project_id: projectId,
+      private_key: privateKey,
+      client_email: clientEmail,
+      auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+      token_uri: 'https://oauth2.googleapis.com/token',
+      auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+      client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${encodeURIComponent(clientEmail)}`,
+    };
+    if (process.env.FIREBASE_PRIVATE_KEY_ID) sa.private_key_id = process.env.FIREBASE_PRIVATE_KEY_ID;
+    if (process.env.FIREBASE_CLIENT_ID) sa.client_id = process.env.FIREBASE_CLIENT_ID;
+    return sa;
+  }
 
   if (useServiceAccount) {
     let serviceAccount = null;
@@ -389,6 +414,8 @@ try {
       }
     } else if (fs.existsSync(serviceAccountPath)) {
       serviceAccount = require(serviceAccountPath);
+    } else {
+      serviceAccount = serviceAccountFromSplitEnv();
     }
 
     if (serviceAccount) {
@@ -396,7 +423,12 @@ try {
         admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
       }
       db = admin.firestore();
-      console.log('✅ Firebase Admin initialisé (service account)');
+      const src = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+        ? 'FIREBASE_SERVICE_ACCOUNT_JSON'
+        : fs.existsSync(serviceAccountPath)
+          ? serviceAccountPath
+          : 'FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY';
+      console.log('✅ Firebase Admin initialisé (service account)', { source: src });
       console.log('[Firebase Admin] projectId:', serviceAccount.project_id || serviceAccount.projectId || '(unknown)');
     } else {
       // Pas de fichier/JSON → fallback ADC
