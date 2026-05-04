@@ -215,9 +215,8 @@ async function createEnvelopeFromPdfBuffer(pdfBuffer, fileName, signerEmail, sig
           email: signerEmail,
           name: signerName,
           recipientId: '1',
-          emailNotification: {
-            supportedLanguage: 'fr',
-          },
+          // Pas de emailNotification ici : certains comptes DocuSign renvoient
+          // USER_LACKS_RECIPIENTEMAILNOTIFICATION_PERMISSION (paramètre admin requis).
           tabs: {
             signHereTabs,
           }
