@@ -122,7 +122,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:5173',
   process.env.ADMIN_URL || 'http://localhost:3000',
-  'https://teal-sunflower-0ade91.netlify.app', // Frontend Netlify (ancien)
+  'https://labelenergie2.netlify.app', // Frontend Netlify (ancien)
   'https://labelenergie1.netlify.app', // Frontend Netlify (nouveau)
   'https://labelenergie234.netlify.app', // Frontend Netlify test
   'http://localhost:5173', // Fallback pour développement
