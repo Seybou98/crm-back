@@ -5150,3 +5150,385 @@ app.get('/api/gocardless/webhooks/status', async (req, res) => {
     });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ONBOARDING RÉGIE — Workflow d'inscription partenaire
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Envoie un email via EmailJS (générique, pour les emails d'onboarding régie).
+ */
+async function sendRegieOnboardingEmail({ toEmail, toName, subject, body }) {
+  const serviceId  = process.env.EMAILJS_WELCOME_SERVICE_ID  || process.env.EMAILJS_SERVICE_ID  || '';
+  const templateId = process.env.EMAILJS_REGIE_TEMPLATE_ID   || process.env.EMAILJS_WELCOME_TEMPLATE_ID || '';
+  const userId     = process.env.EMAILJS_WELCOME_USER_ID     || process.env.EMAILJS_USER_ID     || '';
+  const privateKey = process.env.EMAILJS_WELCOME_PRIVATE_KEY || process.env.EMAILJS_PRIVATE_KEY || '';
+
+  if (!serviceId || !templateId || !userId) {
+    console.warn('[Regie Onboarding] Variables EmailJS manquantes — email non envoyé');
+    return;
+  }
+
+  await axios.post(
+    'https://api.emailjs.com/api/v1.0/email/send',
+    {
+      service_id: serviceId,
+      template_id: templateId,
+      user_id: userId,
+      ...(privateKey ? { accessToken: privateKey } : {}),
+      template_params: {
+        to_email: toEmail,
+        to_name: toName || 'Partenaire',
+        subject,
+        message: body,
+        // Compatibilité templates génériques
+        email: toEmail,
+        recipient_email: toEmail,
+        client_name: toName || 'Partenaire',
+      },
+    },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+  );
+}
+
+/**
+ * POST /api/regie-onboarding/submit
+ * Reçoit le formulaire public, crée la fiche régie et uploade les documents.
+ */
+app.post('/api/regie-onboarding/submit', async (req, res) => {
+  console.log('[Regie Onboarding] Nouvelle demande reçue');
+  try {
+    if (!db) return res.status(503).json({ success: false, error: 'Firebase non initialisé' });
+
+    const { formData, documents } = req.body;
+    if (!formData?.raisonSociale) {
+      return res.status(400).json({ success: false, error: 'raisonSociale requis' });
+    }
+
+    // 1. Créer la fiche régie
+    const regieData = {
+      nom: formData.raisonSociale,
+      status: "Demande d'ouverture",
+      onboarding: {
+        societe: {
+          raisonSociale:     formData.raisonSociale     || '',
+          nomCommercial:     formData.nomCommercial     || '',
+          formeJuridique:    formData.formeJuridique    || '',
+          siren:             formData.siren             || '',
+          siret:             formData.siret             || '',
+          tvaIntracom:       formData.tvaIntracom       || '',
+          dateCreation:      formData.dateCreation      || '',
+          adresse:           formData.adresse           || '',
+          complementAdresse: formData.complementAdresse || '',
+          codePostal:        formData.codePostal        || '',
+          ville:             formData.ville             || '',
+          pays:              formData.pays              || 'France',
+        },
+        responsableLegal: {
+          nom:       formData.nom       || '',
+          prenom:    formData.prenom    || '',
+          fonction:  formData.fonction  || '',
+          telephone: formData.telephone || '',
+          email:     formData.email     || '',
+        },
+        activite: {
+          nombreCommerciaux:    formData.nombreCommerciaux    || '',
+          dossiersMensuels:     formData.dossiersMensuels     || '',
+          zonesIntervention:    formData.zonesIntervention    || '',
+          produitsCommercialises: formData.produitsCommercialises || '',
+        },
+        documents: {},
+      },
+      historique: [{
+        date: new Date().toISOString(),
+        action: 'Demande déposée',
+        details: `Demande déposée par ${formData.prenom || ''} ${formData.nom || ''} (${formData.email || ''})`,
+      }],
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    const docRef = await collection(db, 'regies').add(regieData);
+    const regieId = docRef.id;
+    await updateDoc(doc(db, 'regies', regieId), { id: regieId });
+
+    // 2. Uploader les documents vers Firebase Storage
+    const documentPaths = {};
+    if (documents && typeof documents === 'object') {
+      const storageBucketName = process.env.FIREBASE_STORAGE_BUCKET ||
+        `${(admin.app().options.credential?.projectId || process.env.FIREBASE_PROJECT_ID || 'crm-pose')}.appspot.com`;
+
+      let bucket;
+      try {
+        bucket = admin.storage().bucket(storageBucketName);
+      } catch (e) {
+        console.warn('[Regie Onboarding] Storage non disponible:', e.message);
+      }
+
+      if (bucket) {
+        for (const [key, fileData] of Object.entries(documents)) {
+          try {
+            const { base64, filename, contentType } = fileData;
+            if (!base64) continue;
+            const buffer = Buffer.from(base64, 'base64');
+            const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+            const storagePath = `regies/${regieId}/onboarding/${key}/${safeName}`;
+            const fileRef = bucket.file(storagePath);
+            await fileRef.save(buffer, {
+              metadata: { contentType: contentType || 'application/octet-stream' },
+            });
+            documentPaths[key] = storagePath;
+            console.log(`[Regie Onboarding] Document uploadé: ${storagePath}`);
+          } catch (uploadErr) {
+            console.warn(`[Regie Onboarding] Erreur upload ${key}:`, uploadErr.message);
+          }
+        }
+        if (Object.keys(documentPaths).length > 0) {
+          await updateDoc(doc(db, 'regies', regieId), { 'onboarding.documents': documentPaths });
+        }
+      }
+    }
+
+    // 3. Notification aux admins
+    try {
+      const usersSnap = await getDocs(collection(db, 'users'));
+      const adminIds = usersSnap.docs
+        .filter(d => {
+          const role = String(d.data()?.role || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+          return role === 'administrateur' || role === 'rh';
+        })
+        .map(d => d.id);
+
+      if (adminIds.length > 0) {
+        await collection(db, 'notifications').add({
+          category: 'new_dossier',
+          type: 'lead',
+          source: 'onboarding',
+          title: `Nouvelle demande partenariat — ${formData.raisonSociale}`,
+          description: `${formData.prenom || ''} ${formData.nom || ''} (${formData.email || ''}) a déposé une demande d'ouverture de compte régie.`,
+          recipientIds: adminIds,
+          regieId,
+          read: false,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    } catch (notifErr) {
+      console.warn('[Regie Onboarding] Notification impossible:', notifErr.message);
+    }
+
+    console.log(`[Regie Onboarding] ✅ Demande créée: ${regieId}`);
+    return res.json({ success: true, regieId });
+  } catch (err) {
+    console.error('[Regie Onboarding] Erreur submit:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/regie-onboarding/refuse
+ * Envoie un email de refus au candidat.
+ */
+app.post('/api/regie-onboarding/refuse', async (req, res) => {
+  try {
+    const { regieId, email, nom, motif } = req.body;
+    if (!email || !motif) return res.status(400).json({ success: false, error: 'email et motif requis' });
+
+    await sendRegieOnboardingEmail({
+      toEmail: email,
+      toName: nom,
+      subject: 'Label Énergie — Votre demande de partenariat',
+      body: `Bonjour ${nom},\n\nNous avons bien étudié votre demande d'ouverture de compte partenaire et nous regrettons de ne pas pouvoir y donner suite dans l'immédiat.\n\nMotif : ${motif}\n\nN'hésitez pas à nous recontacter pour toute question.\n\nCordialement,\nL'équipe Label Énergie`,
+    });
+
+    console.log(`[Regie Onboarding] Refus envoyé à ${email}`);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('[Regie Onboarding] Erreur refuse:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/regie-onboarding/request-complement
+ * Envoie un email de demande de compléments.
+ */
+app.post('/api/regie-onboarding/request-complement', async (req, res) => {
+  try {
+    const { regieId, email, nom, message } = req.body;
+    if (!email || !message) return res.status(400).json({ success: false, error: 'email et message requis' });
+
+    const frontendUrl = process.env.FRONTEND_URL || 'https://labelenergie1.netlify.app';
+
+    await sendRegieOnboardingEmail({
+      toEmail: email,
+      toName: nom,
+      subject: 'Label Énergie — Compléments requis pour votre dossier',
+      body: `Bonjour ${nom},\n\nNous avons bien reçu votre demande de partenariat et nous vous remercions de l'intérêt que vous portez à Label Énergie.\n\nAfin de traiter votre dossier, nous avons besoin des éléments complémentaires suivants :\n\n${message}\n\nMerci de nous faire parvenir ces éléments dès que possible.\n\nCordialement,\nL'équipe Label Énergie`,
+    });
+
+    console.log(`[Regie Onboarding] Complément demandé à ${email}`);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('[Regie Onboarding] Erreur request-complement:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/regie-onboarding/send-contract
+ * Envoie le contrat de partenariat via DocuSign.
+ */
+app.post('/api/regie-onboarding/send-contract', async (req, res) => {
+  try {
+    if (!docusignService.isConfigured()) {
+      return res.status(503).json({ success: false, error: 'DocuSign non configuré' });
+    }
+    if (!db) return res.status(503).json({ success: false, error: 'Firebase non initialisé' });
+
+    const { regieId, pdfBase64, signerEmail, signerFirstName, signerLastName, raisonSociale } = req.body;
+    if (!pdfBase64 || !signerEmail || !regieId) {
+      return res.status(400).json({ success: false, error: 'pdfBase64, signerEmail et regieId requis' });
+    }
+
+    const pdfBuffer = Buffer.from(pdfBase64, 'base64');
+    const { envelopeId } = await docusignService.createEnvelopeFromPdfBuffer(
+      pdfBuffer,
+      `contrat-partenariat-${raisonSociale || regieId}.pdf`,
+      signerEmail,
+      signerFirstName || '',
+      signerLastName || '',
+      {
+        emailSubject: `Contrat de partenariat Label Énergie — Signature requise`,
+        emailBody: `Bonjour,\n\nVeuillez trouver ci-joint votre contrat de partenariat Label Énergie à signer électroniquement.\n\nCordialement,\nL'équipe Label Énergie`,
+        includeSepaTabs: false,
+      }
+    );
+
+    // Mettre à jour la fiche régie
+    await updateDoc(doc(db, 'regies', regieId), {
+      status: 'Contrat envoyé',
+      'onboarding.docusignEnvelopeId': envelopeId,
+      'onboarding.docusignStatus': 'sent',
+      'onboarding.docusignSentAt': new Date().toISOString(),
+    });
+
+    console.log(`[Regie Onboarding] Contrat envoyé via DocuSign: ${envelopeId}`);
+    return res.json({ success: true, envelopeId });
+  } catch (err) {
+    console.error('[Regie Onboarding] Erreur send-contract:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/regie-onboarding/create-account
+ * Crée le compte Firebase Auth + utilisateur Firestore + email de bienvenue.
+ */
+app.post('/api/regie-onboarding/create-account', async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ success: false, error: 'Firebase non initialisé' });
+
+    const { regieId, email, firstName, lastName, raisonSociale } = req.body;
+    if (!email || !regieId) return res.status(400).json({ success: false, error: 'email et regieId requis' });
+
+    // Créer l'utilisateur Firebase Auth
+    let uid;
+    try {
+      const userRecord = await admin.auth().createUser({
+        email,
+        displayName: `${firstName || ''} ${lastName || ''}`.trim() || raisonSociale,
+        emailVerified: false,
+      });
+      uid = userRecord.uid;
+    } catch (authErr) {
+      if (authErr.code === 'auth/email-already-exists') {
+        const existing = await admin.auth().getUserByEmail(email);
+        uid = existing.uid;
+      } else throw authErr;
+    }
+
+    // Générer un lien de définition du mot de passe (à usage unique)
+    const passwordLink = await admin.auth().generatePasswordResetLink(email, {
+      url: process.env.FRONTEND_URL || 'https://labelenergie1.netlify.app',
+    });
+
+    // Créer le document utilisateur dans Firestore
+    await setDoc(doc(db, 'users', uid), {
+      uid,
+      email,
+      firstName: firstName || '',
+      lastName: lastName || '',
+      role: 'regie',
+      regie: { id: regieId, name: raisonSociale || '' },
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      status: 'active',
+    });
+
+    // Mettre à jour la fiche régie
+    await updateDoc(doc(db, 'regies', regieId), {
+      status: 'Régie active',
+      'onboarding.accountCreatedAt': new Date().toISOString(),
+      'onboarding.accountUid': uid,
+    });
+
+    // Envoyer l'email de bienvenue avec le lien de création de mot de passe
+    await sendRegieOnboardingEmail({
+      toEmail: email,
+      toName: `${firstName || ''} ${lastName || ''}`.trim(),
+      subject: 'Bienvenue chez Label Énergie — Votre compte partenaire est activé',
+      body: `Bonjour ${firstName || ''},\n\nNous avons le plaisir de vous informer que votre compte partenaire Label Énergie est maintenant activé.\n\nPour accéder à votre espace, vous devez d'abord créer votre mot de passe en cliquant sur le lien ci-dessous :\n\n${passwordLink}\n\nCe lien est personnel, à usage unique et expire dans 24 heures.\n\nUne fois connecté, vous aurez accès à :\n• Votre tableau de bord régie\n• Le suivi de vos dossiers\n• Vos factures et commissions\n\nPour toute question, notre équipe est à votre disposition.\n\nCordialement,\nL'équipe Label Énergie`,
+    });
+
+    console.log(`[Regie Onboarding] Compte créé pour ${email} (uid: ${uid})`);
+    return res.json({ success: true, uid });
+  } catch (err) {
+    console.error('[Regie Onboarding] Erreur create-account:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Extension du webhook DocuSign existant — gestion des contrats de partenariat régie
+// (Le webhook principal à /api/docusign/webhook gère déjà maintenances,
+//  ce handler complémentaire détecte les régie onboarding via onboarding.docusignEnvelopeId)
+app.post('/api/docusign/webhook/regie', express.json(), async (req, res) => {
+  try {
+    const envelopeId = req.body.envelopeId || req.body.data?.envelopeId;
+    const status     = req.body.status     || req.body.data?.status;
+    if (!envelopeId) return res.status(400).json({ error: 'envelopeId manquant' });
+
+    console.log('[DocuSign][Webhook Régie]', { envelopeId, status });
+    res.json({ received: true });
+
+    if (!db) return;
+
+    // Chercher la régie liée à cet envelopeId
+    const snap = await getDocs(query(collection(db, 'regies'), where('onboarding.docusignEnvelopeId', '==', envelopeId)));
+    if (snap.empty) return;
+
+    const regieDoc = snap.docs[0];
+    const regieId  = regieDoc.id;
+    const updateData = { 'onboarding.docusignStatus': status };
+
+    if (status === 'completed') {
+      let signedAt = new Date().toISOString();
+      try {
+        const envelope = await docusignService.getEnvelopeStatus(envelopeId);
+        signedAt = envelope.signers?.find(s => s.signedDateTime)?.signedDateTime || signedAt;
+      } catch (e) { /* ignore */ }
+
+      Object.assign(updateData, {
+        status: 'Contrat signé',
+        'onboarding.docusignSignedAt': signedAt,
+        historique: admin.firestore.FieldValue.arrayUnion({
+          date: new Date().toISOString(),
+          action: 'Contrat signé',
+          details: `Signature confirmée par DocuSign (envelope: ${envelopeId})`,
+        }),
+      });
+    }
+
+    await updateDoc(doc(db, 'regies', regieId), updateData);
+    console.log(`[DocuSign][Webhook Régie] Régie ${regieId} mise à jour → ${status}`);
+  } catch (err) {
+    console.error('[DocuSign][Webhook Régie] Erreur:', err.message);
+  }
+});

@@ -182,25 +182,15 @@ async function createEnvelopeFromPdfBuffer(pdfBuffer, fileName, signerEmail, sig
     });
   }
 
-  // Rétractation (page 5) — formulaire légal ; l’ancre vient du PDF généré côté front
-  signHereTabs.push({
-    documentId: '1',
-    tabLabel: 'SignatureRetractation',
-    anchorString: 'DS_SIGNATURE_RETRACTATION',
-    anchorUnits: 'pixels',
-    anchorXOffset: '0',
-    anchorYOffset: '0',
-    anchorMatchWholeWord: 'true',
-    anchorCaseSensitive: 'true',
-    anchorIgnoreIfNotPresent: 'true',
-  });
+  // Page 5 (rétractation) : pas de signature DocuSign — le client remplit ce formulaire
+  // uniquement en cas de rétractation ultérieure (courrier / e-mail).
 
   // Pas d’onglets « Date signée » : le format affiché suit le compte DocuSign (souvent US) et l’API
   // n’accepte pas un motif JJ/MM/AAAA fiable. La date « Le : » est imprimée en JJ/MM/AAAA dans le PDF.
 
   const envelopeDefinition = {
-    emailSubject: options.emailSubject || 'Document à signer',
-    emailBlurb: options.emailBody || 'Veuillez signer le document ci-joint.',
+    emailSubject: options.emailSubject || 'Votre contrat Label Énergie — Signature requise',
+    emailBlurb: options.emailBody || 'Madame, Monsieur,\n\nNous vous remercions de l\'intérêt que vous portez à nos services.\n\nVeuillez trouver ci-joint votre contrat de souscription. Nous vous invitons à en prendre connaissance attentivement avant de procéder à la signature électronique via le bouton ci-dessus.\n\nPour toute question relative au document ou à nos offres, notre équipe reste disponible à votre disposition.\n\nCordialement,\nL\'équipe Label Énergie',
     documents: [
       {
         documentBase64,
