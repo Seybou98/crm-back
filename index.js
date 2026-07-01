@@ -5288,15 +5288,14 @@ app.post('/api/regie-onboarding/submit', async (req, res) => {
       }
     }
 
-    // 3. Notification aux admins
+    // 3. Notification aux admins (Firestore + email)
     try {
       const usersSnap = await getDocs(collection(db, 'users'));
-      const adminIds = usersSnap.docs
-        .filter(d => {
-          const role = String(d.data()?.role || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
-          return role === 'administrateur' || role === 'rh';
-        })
-        .map(d => d.id);
+      const adminDocs = usersSnap.docs.filter(d => {
+        const role = String(d.data()?.role || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+        return role === 'administrateur' || role === 'rh';
+      });
+      const adminIds = adminDocs.map(d => d.id);
 
       if (adminIds.length > 0) {
         await collection(db, 'notifications').add({
@@ -5310,6 +5309,25 @@ app.post('/api/regie-onboarding/submit', async (req, res) => {
           read: false,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
+      }
+
+      // Envoi email à chaque admin
+      const frontendUrl = process.env.FRONTEND_URL || 'https://labelenergie1.netlify.app';
+      for (const adminDoc of adminDocs) {
+        const adminEmail = adminDoc.data()?.email;
+        const adminName  = adminDoc.data()?.displayName || adminDoc.data()?.prenom || 'Administrateur';
+        if (!adminEmail) continue;
+        try {
+          await sendRegieOnboardingEmail({
+            toEmail: adminEmail,
+            toName: adminName,
+            subject: `Nouvelle demande partenariat — ${formData.raisonSociale || ''}`,
+            body: `Bonjour ${adminName},\n\nUne nouvelle demande d'ouverture de compte partenaire régie vient d'être reçue.\n\nSociété : ${formData.raisonSociale || '—'}\nContact : ${formData.prenom || ''} ${formData.nom || ''}\nEmail : ${formData.email || '—'}\nTéléphone : ${formData.telephone || '—'}\n\nConsultez la demande dans le CRM :\n${frontendUrl}/regie/${regieId}\n\nCordialement,\nLabel Énergie CRM`,
+          });
+          console.log(`[Regie Onboarding] Email admin envoyé à ${adminEmail}`);
+        } catch (mailErr) {
+          console.warn(`[Regie Onboarding] Email admin impossible pour ${adminEmail}:`, mailErr.message);
+        }
       }
     } catch (notifErr) {
       console.warn('[Regie Onboarding] Notification impossible:', notifErr.message);
