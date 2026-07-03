@@ -378,13 +378,13 @@ async function sendWelcomeEmailViaEmailJs(args) {
   console.log('[EmailJS][Welcome] ✅ sent', { ms: Date.now() - startedAt, status: response.status });
 }
 
-// Email "lien de prélèvement GoCardless" — réutilise par défaut le template de bienvenue
-// tant qu'un template EmailJS dédié n'a pas été créé côté dashboard (EMAILJS_BILLING_REQUEST_TEMPLATE_ID).
-const EMAILJS_BILLING_REQUEST_SERVICE_ID = process.env.EMAILJS_BILLING_REQUEST_SERVICE_ID || EMAILJS_WELCOME_SERVICE_ID;
-const EMAILJS_BILLING_REQUEST_TEMPLATE_ID = process.env.EMAILJS_BILLING_REQUEST_TEMPLATE_ID || EMAILJS_WELCOME_TEMPLATE_ID;
-const EMAILJS_BILLING_REQUEST_USER_ID = process.env.EMAILJS_BILLING_REQUEST_USER_ID || EMAILJS_WELCOME_USER_ID;
+// Email "lien de prélèvement GoCardless" — template dédié (EMAILJS_FINALISATION_*), avec repli sur
+// le template de bienvenue si les variables dédiées ne sont pas configurées dans l'environnement.
+const EMAILJS_BILLING_REQUEST_SERVICE_ID = process.env.EMAILJS_FINALISATION_SERVICE_ID || EMAILJS_WELCOME_SERVICE_ID;
+const EMAILJS_BILLING_REQUEST_TEMPLATE_ID = process.env.EMAILJS_FINALISATION_TEMPLATE_ID || EMAILJS_WELCOME_TEMPLATE_ID;
+const EMAILJS_BILLING_REQUEST_USER_ID = process.env.EMAILJS_FINALISATION_USER_ID || EMAILJS_WELCOME_USER_ID;
 const EMAILJS_BILLING_REQUEST_PRIVATE_KEY =
-  process.env.EMAILJS_BILLING_REQUEST_PRIVATE_KEY || EMAILJS_WELCOME_PRIVATE_KEY;
+  process.env.EMAILJS_FINALISATION_PRIVATE_KEY || EMAILJS_WELCOME_PRIVATE_KEY;
 
 async function sendBillingRequestLinkEmail({ toEmail, clientName, contractNumber, authorisationUrl }) {
   if (!toEmail || typeof toEmail !== 'string' || !toEmail.includes('@')) {
