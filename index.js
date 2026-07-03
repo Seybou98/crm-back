@@ -1344,9 +1344,7 @@ app.post('/create-mandate', async (req, res) => {
 
     console.log('[GoCardless] Creditor ID utilisé:', process.env.GOCARDLESS_CREDITOR_ID);
 
-    // Forcer l'utilisation de l'API sandbox pour les tests
-    const apiUrl = 'https://api-sandbox.gocardless.com';
-    console.log('[GoCardless] Utilisation forcée de l\'API sandbox pour les tests:', apiUrl);
+    const apiUrl = getGoCardlessApiUrl();
 
     // Vérifier le statut du creditor (AJOUTÉ)
     try {
