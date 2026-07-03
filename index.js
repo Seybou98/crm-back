@@ -116,7 +116,13 @@ async function updateDoc(docRef, data) {
 
 const app = express();
 // Augmenter la limite de taille pour permettre l'envoi de PDF en base64 (jusqu'à 50MB)
-app.use(express.json({ limit: '50mb' }));
+// verify: conserve les octets bruts du body (req.rawBody) AVANT parsing JSON — nécessaire pour
+// valider la signature HMAC des webhooks GoCardless (JSON.stringify(req.body) ne reproduit pas
+// forcément les octets exacts signés par GoCardless : ordre des clés, espaces, etc.)
+app.use(express.json({
+  limit: '50mb',
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // Configuration CORS dynamique pour production
 const allowedOrigins = [
@@ -370,6 +376,61 @@ async function sendWelcomeEmailViaEmailJs(args) {
   );
 
   console.log('[EmailJS][Welcome] ✅ sent', { ms: Date.now() - startedAt, status: response.status });
+}
+
+// Email "lien de prélèvement GoCardless" — réutilise par défaut le template de bienvenue
+// tant qu'un template EmailJS dédié n'a pas été créé côté dashboard (EMAILJS_BILLING_REQUEST_TEMPLATE_ID).
+const EMAILJS_BILLING_REQUEST_SERVICE_ID = process.env.EMAILJS_BILLING_REQUEST_SERVICE_ID || EMAILJS_WELCOME_SERVICE_ID;
+const EMAILJS_BILLING_REQUEST_TEMPLATE_ID = process.env.EMAILJS_BILLING_REQUEST_TEMPLATE_ID || EMAILJS_WELCOME_TEMPLATE_ID;
+const EMAILJS_BILLING_REQUEST_USER_ID = process.env.EMAILJS_BILLING_REQUEST_USER_ID || EMAILJS_WELCOME_USER_ID;
+const EMAILJS_BILLING_REQUEST_PRIVATE_KEY =
+  process.env.EMAILJS_BILLING_REQUEST_PRIVATE_KEY || EMAILJS_WELCOME_PRIVATE_KEY;
+
+async function sendBillingRequestLinkEmail({ toEmail, clientName, contractNumber, authorisationUrl }) {
+  if (!toEmail || typeof toEmail !== 'string' || !toEmail.includes('@')) {
+    throw new Error('EmailJS billing-request: toEmail manquant ou invalide');
+  }
+  if (!EMAILJS_BILLING_REQUEST_SERVICE_ID || !EMAILJS_BILLING_REQUEST_TEMPLATE_ID || !EMAILJS_BILLING_REQUEST_USER_ID) {
+    throw new Error('EmailJS billing-request: variables d’environnement manquantes (service/template/user)');
+  }
+
+  const templateParams = {
+    to_email: toEmail.trim(),
+    client_name: (clientName || '').toString(),
+    contract_number: (contractNumber || '').toString(),
+    billing_request_url: authorisationUrl,
+    // Variantes fréquentes selon templates EmailJS
+    email: toEmail.trim(),
+    recipient_email: toEmail.trim(),
+    portal_url: authorisationUrl,
+  };
+
+  const startedAt = Date.now();
+  console.log('[EmailJS][BillingRequest] → send', {
+    serviceId: EMAILJS_BILLING_REQUEST_SERVICE_ID,
+    templateId: EMAILJS_BILLING_REQUEST_TEMPLATE_ID,
+    to: toEmail,
+    contractNumber,
+  });
+
+  const payload = {
+    service_id: EMAILJS_BILLING_REQUEST_SERVICE_ID,
+    template_id: EMAILJS_BILLING_REQUEST_TEMPLATE_ID,
+    user_id: EMAILJS_BILLING_REQUEST_USER_ID,
+    ...(EMAILJS_BILLING_REQUEST_PRIVATE_KEY ? { accessToken: EMAILJS_BILLING_REQUEST_PRIVATE_KEY } : {}),
+    template_params: templateParams,
+  };
+
+  const response = await axios.post(
+    'https://api.emailjs.com/api/v1.0/email/send',
+    payload,
+    {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 15000,
+    }
+  );
+
+  console.log('[EmailJS][BillingRequest] ✅ sent', { ms: Date.now() - startedAt, status: response.status });
 }
 
 // Configuration Firebase pour la synchronisation YouSign
@@ -813,6 +874,101 @@ app.post('/create-subscription', async (req, res) => {
 });
 
 // POST : créer mandat + subscription, ou uniquement subscription si mandate_id fourni
+// Fonction partagée : crée un abonnement GoCardless sur un mandat déjà existant (actif) et
+// écrit le résultat dans Firestore. Utilisée à la fois par /create-maintenance-subscription
+// (branche "mandat existant") et par le handler webhook billing_requests.fulfilled.
+async function createSubscriptionForMandate({
+  mandateId,
+  mandateStatus = null,
+  customerId = null,
+  bankAccountId = null,
+  amount,
+  currency = 'EUR',
+  interval_unit = 'monthly',
+  interval = 1,
+  day_of_month,
+  start_date,
+  metadata = {}
+}) {
+  const apiUrl = getGoCardlessApiUrl();
+  const limitedMetadata = {
+    contractNumber: metadata?.contractNumber || '',
+    maintenanceId: metadata?.maintenanceId || '',
+    clientId: metadata?.clientId || ''
+  };
+
+  // day_of_month : 1-28 ou -1 (dernier jour). Obligatoire pour monthly/yearly.
+  // ⚠️ Robustesse: certaines sources (Firestore/JSON) envoient "14" (string) → on normalise.
+  const parsedDayOfMonth =
+    typeof day_of_month === 'number'
+      ? day_of_month
+      : (typeof day_of_month === 'string' && day_of_month.trim()
+        ? Number(day_of_month.trim())
+        : NaN);
+
+  const normalizedDayOfMonth =
+    Number.isFinite(parsedDayOfMonth) && parsedDayOfMonth >= 1 && parsedDayOfMonth <= 28
+      ? parsedDayOfMonth
+      : (parsedDayOfMonth === -1 ? -1 : 1);
+
+  // Doc GoCardless : amount et day_of_month en string dans les exemples
+  const amountMinor = String(Math.round(amount * 100));
+  const subscriptionBody = {
+    subscriptions: {
+      amount: amountMinor,
+      currency,
+      name: (metadata?.contractNumber ? `Maintenance ${metadata.contractNumber}` : `Subscription ${mandateId}`).slice(0, 255),
+      interval_unit,
+      interval,
+      day_of_month: String(normalizedDayOfMonth),
+      links: { mandate: mandateId },
+      metadata: limitedMetadata
+    }
+  };
+  console.log('[GoCardless] Body subscription envoyé:', JSON.stringify(subscriptionBody, null, 2));
+
+  const subscriptionResponse = await axios.post(`${apiUrl}/subscriptions`, subscriptionBody, {
+    headers: {
+      'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+      'GoCardless-Version': '2015-07-06',
+      'Content-Type': 'application/json'
+    }
+  });
+
+  const subscription = subscriptionResponse.data.subscriptions;
+  console.log('[GoCardless] ✅ Subscription créée:', subscription.id);
+
+  // Sauvegarder dans Firestore
+  if (metadata?.maintenanceId && db) {
+    try {
+      const maintenanceRef = doc(db, 'maintenances', metadata.maintenanceId);
+      const firestoreUpdate = {
+        mandateId: mandateId,
+        mandateStatus: mandateStatus || 'active',
+        subscriptionId: subscription.id,
+        subscriptionStatus: subscription.status,
+        billingIntervalUnit: interval_unit,
+        billingInterval: interval,
+        nextChargeDate: subscription.next_charge_date || null,
+        contractStartDate: start_date || new Date().toISOString().split('T')[0],
+        billingMode: 'subscription',
+        updatedAt: new Date().toISOString()
+      };
+      if (customerId) firestoreUpdate.customerId = customerId;
+      if (bankAccountId) firestoreUpdate.bankAccountId = bankAccountId;
+      firestoreUpdate.gocardlessSubscriptionPending = false;
+      firestoreUpdate.gocardlessMandateId = mandateId;
+      firestoreUpdate.gcMandateStatus = 'mandate_active';
+      await updateDoc(maintenanceRef, firestoreUpdate);
+      console.log('[GoCardless] ✅ Firestore mis à jour:', metadata.maintenanceId);
+    } catch (firestoreError) {
+      console.error('[GoCardless] ⚠️ Erreur Firestore:', firestoreError.message);
+    }
+  }
+
+  return { subscription };
+}
+
 app.post('/create-maintenance-subscription', async (req, res) => {
   try {
     const existingMandateId = req.body.mandate_id || req.body.mandateId;
@@ -946,75 +1102,20 @@ app.post('/create-maintenance-subscription', async (req, res) => {
 
     console.log('[GoCardless] 🔸 ÉTAPE 2/2: Création subscription...');
 
-    // day_of_month : 1-28 ou -1 (dernier jour). Obligatoire pour monthly/yearly.
     // Sans start_date, GoCardless utilise next_possible_charge_date du mandat (doc GoCardless).
-    // ⚠️ Robustesse: certaines sources (Firestore/JSON) envoient "14" (string) → on normalise.
-    const rawDayOfMonth = req.body.day_of_month;
-    const parsedDayOfMonth =
-      typeof rawDayOfMonth === 'number'
-        ? rawDayOfMonth
-        : (typeof rawDayOfMonth === 'string' && rawDayOfMonth.trim()
-          ? Number(rawDayOfMonth.trim())
-          : NaN);
-
-    const dayOfMonth =
-      Number.isFinite(parsedDayOfMonth) && parsedDayOfMonth >= 1 && parsedDayOfMonth <= 28
-        ? parsedDayOfMonth
-        : (parsedDayOfMonth === -1 ? -1 : 1);
-
-    // Doc GoCardless : amount et day_of_month en string dans les exemples
-    const amountMinor = String(Math.round(amount * 100));
-    const subscriptionBody = {
-      subscriptions: {
-        amount: amountMinor,
-        currency,
-        name: (metadata?.contractNumber ? `Maintenance ${metadata.contractNumber}` : `Subscription ${mandateId}`).slice(0, 255),
-        interval_unit,
-        interval,
-        day_of_month: String(dayOfMonth),
-        links: { mandate: mandateId },
-        metadata: limitedMetadata
-      }
-    };
-    console.log('[GoCardless] Body subscription envoyé:', JSON.stringify(subscriptionBody, null, 2));
-
-    const subscriptionResponse = await axios.post(`${apiUrl}/subscriptions`, subscriptionBody, {
-      headers: {
-        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
-        'GoCardless-Version': '2015-07-06',
-        'Content-Type': 'application/json'
-      }
+    const { subscription } = await createSubscriptionForMandate({
+      mandateId,
+      mandateStatus,
+      customerId,
+      bankAccountId,
+      amount,
+      currency,
+      interval_unit,
+      interval,
+      day_of_month: req.body.day_of_month,
+      start_date,
+      metadata
     });
-
-    const subscription = subscriptionResponse.data.subscriptions;
-    console.log('[GoCardless] ✅ Subscription créée:', subscription.id);
-
-    // Sauvegarder dans Firestore
-    if (metadata?.maintenanceId && db) {
-      try {
-        const maintenanceRef = doc(db, 'maintenances', metadata.maintenanceId);
-        const firestoreUpdate = {
-          mandateId: mandateId,
-          mandateStatus: mandateStatus || 'active',
-          subscriptionId: subscription.id,
-          subscriptionStatus: subscription.status,
-          billingIntervalUnit: interval_unit,
-          billingInterval: interval,
-          nextChargeDate: subscription.next_charge_date || null,
-          contractStartDate: start_date || new Date().toISOString().split('T')[0],
-          billingMode: 'subscription',
-          updatedAt: new Date().toISOString()
-        };
-        if (customerId) firestoreUpdate.customerId = customerId;
-        if (bankAccountId) firestoreUpdate.bankAccountId = bankAccountId;
-        firestoreUpdate.gocardlessSubscriptionPending = false;
-        firestoreUpdate.gocardlessMandateId = mandateId;
-        await updateDoc(maintenanceRef, firestoreUpdate);
-        console.log('[GoCardless] ✅ Firestore mis à jour:', metadata.maintenanceId);
-      } catch (firestoreError) {
-        console.error('[GoCardless] ⚠️ Erreur Firestore:', firestoreError.message);
-      }
-    }
 
     console.log('[GoCardless] ========================================');
     console.log('[GoCardless] ✅ MANDAT + SUBSCRIPTION créés avec succès !');
@@ -1055,6 +1156,194 @@ app.post('/create-maintenance-subscription', async (req, res) => {
       error: 'Erreur lors de la création du mandat et de la subscription',
       details: errData || error.message,
       validationErrors: validationErrors || undefined
+    });
+  }
+});
+
+// POST /api/gocardless/billing-requests — crée un Billing Request + Billing Request Flow.
+// Remplace la création directe de mandat (IBAN saisi côté serveur), interdite par GoCardless
+// en live sans approbation "scheme rules compliant". Le client saisit lui-même son IBAN sur
+// la page hébergée GoCardless (authorisationUrl), envoyée par email.
+app.post('/api/gocardless/billing-requests', async (req, res) => {
+  try {
+    const {
+      maintenanceId,
+      contractNumber,
+      clientId,
+      clientEmail,
+      clientName,
+      redirect_uri,
+      exit_uri
+    } = req.body;
+
+    if (!maintenanceId) {
+      return res.status(400).json({ error: 'maintenanceId est requis' });
+    }
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN || !process.env.GOCARDLESS_CREDITOR_ID) {
+      return res.status(500).json({ error: 'Configuration GoCardless manquante (token ou creditor)' });
+    }
+    if (!db) {
+      return res.status(500).json({ error: 'Firebase non initialisé' });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const limitedMetadata = {
+      contractNumber: contractNumber || '',
+      maintenanceId: maintenanceId || '',
+      clientId: clientId || ''
+    };
+
+    console.log('[GoCardless][BillingRequest] 🚀 Création billing_request pour maintenance:', maintenanceId);
+
+    const billingRequestResponse = await axios.post(`${apiUrl}/billing_requests`, {
+      billing_requests: {
+        mandate_request: {
+          currency: 'EUR',
+          scheme: 'sepa_core'
+        },
+        metadata: limitedMetadata
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const billingRequestId = billingRequestResponse.data.billing_requests.id;
+    console.log('[GoCardless][BillingRequest] ✅ Billing request créé:', billingRequestId);
+
+    // redirect_uri/exit_uri : le client ne revient jamais dans le CRM (flux par email), une page
+    // de destination minimale suffit — voir points ouverts du plan (URL https joignable requise en live).
+    const frontendUrl = (process.env.FRONTEND_URL || process.env.PUBLIC_URL || 'http://localhost:5173').replace(/\/$/, '');
+    const flowResponse = await axios.post(`${apiUrl}/billing_request_flows`, {
+      billing_request_flows: {
+        redirect_uri: redirect_uri || `${frontendUrl}/prelevement-confirme`,
+        exit_uri: exit_uri || `${frontendUrl}/prelevement-annule`,
+        links: { billing_request: billingRequestId }
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const billingRequestFlow = flowResponse.data.billing_request_flows;
+    const authorisationUrl = billingRequestFlow.authorisation_url;
+    console.log('[GoCardless][BillingRequest] ✅ Flow créé, authorisation_url:', authorisationUrl);
+
+    // Écrire l'état "en attente" immédiatement, avant même l'envoi de l'email
+    const maintenanceRef = doc(db, 'maintenances', maintenanceId);
+    await updateDoc(maintenanceRef, {
+      gcBillingRequestId: billingRequestId,
+      gcBillingRequestFlowId: billingRequestFlow.id,
+      gcBillingRequestUrl: authorisationUrl,
+      gcMandateStatus: 'pending_customer_action',
+      gcBillingRequestSentAt: new Date().toISOString(),
+      gocardlessSubscriptionPending: false
+    });
+
+    // Email non bloquant : le lien reste utilisable (copier/coller manuel) même si l'envoi échoue
+    let emailSent = false;
+    try {
+      if (clientEmail) {
+        await sendBillingRequestLinkEmail({
+          toEmail: clientEmail,
+          clientName: clientName || '',
+          contractNumber: contractNumber || '',
+          authorisationUrl
+        });
+        emailSent = true;
+      }
+    } catch (emailError) {
+      console.error('[GoCardless][BillingRequest] ⚠️ Erreur envoi email (non bloquant):', emailError.message);
+    }
+
+    try {
+      await updateDoc(maintenanceRef, { gcBillingRequestEmailStatus: emailSent ? 'success' : 'error' });
+    } catch (e) {
+      console.warn('[GoCardless][BillingRequest] Impossible d’écrire gcBillingRequestEmailStatus:', e.message);
+    }
+
+    res.json({
+      success: true,
+      billingRequestId,
+      billingRequestFlowId: billingRequestFlow.id,
+      authorisationUrl,
+      emailSent
+    });
+  } catch (error) {
+    const errData = error.response?.data;
+    console.error('[GoCardless][BillingRequest] ❌ Erreur création billing request:', error.message, error.response?.status, error.config?.url);
+    if (errData) {
+      console.error('[GoCardless][BillingRequest] Réponse complète:', JSON.stringify(errData, null, 2));
+    }
+    res.status(error.response?.status || 500).json({
+      error: 'Erreur lors de la création du billing request',
+      details: errData || error.message
+    });
+  }
+});
+
+// GET /api/gocardless/billing-request-status — statut d'un billing request + filet de sécurité :
+// si déjà "fulfilled" mais qu'aucun abonnement n'existe encore (webhook pas encore arrivé),
+// crée l'abonnement à la volée (mêmes logique/écritures que le webhook billing_requests.fulfilled).
+app.get('/api/gocardless/billing-request-status', async (req, res) => {
+  try {
+    const { billingRequestId, maintenanceId } = req.query;
+    if (!billingRequestId) {
+      return res.status(400).json({ error: 'billingRequestId est requis' });
+    }
+    if (!process.env.GOCARDLESS_ACCESS_TOKEN) {
+      return res.status(500).json({ error: 'GOCARDLESS_ACCESS_TOKEN manquant' });
+    }
+
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.get(`${apiUrl}/billing_requests/${billingRequestId}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const billingRequest = response.data.billing_requests;
+    const fulfilled = billingRequest.status === 'fulfilled';
+    // ⚠️ Nom de champ à confirmer contre une vraie réponse sandbox (voir plan) — mandate_request_mandate probable.
+    const mandateId = billingRequest.links?.mandate_request_mandate || billingRequest.links?.mandate || null;
+
+    let subscription = null;
+    if (fulfilled && mandateId && maintenanceId && db) {
+      const maintenanceSnap = await getDoc(doc(db, 'maintenances', String(maintenanceId)));
+      if (maintenanceSnap.exists()) {
+        const maintenance = maintenanceSnap.data();
+        if (!maintenance.subscriptionId) {
+          const created = await createSubscriptionForMandate({
+            mandateId,
+            customerId: billingRequest.links?.customer || null,
+            bankAccountId: billingRequest.links?.customer_bank_account || null,
+            amount: maintenance.monthlyAmount,
+            day_of_month: maintenance.paymentDate,
+            metadata: {
+              contractNumber: maintenance.contractNumber,
+              maintenanceId: String(maintenanceId),
+              clientId: maintenance.clientId
+            }
+          });
+          subscription = created.subscription;
+        }
+      }
+    }
+
+    res.json({ success: true, status: billingRequest.status, fulfilled, mandateId, subscription });
+  } catch (error) {
+    console.error('[GoCardless][BillingRequestStatus] ❌ Erreur:', error.response?.data || error.message);
+    res.status(error.response?.status || 500).json({
+      error: 'Erreur lors de la récupération du statut du billing request',
+      details: error.response?.data || error.message
     });
   }
 });
@@ -3760,8 +4049,18 @@ app.post('/api/docusign/webhook', express.json(), async (req, res) => {
 });
 
 // POST : endpoint webhook pour recevoir les notifications GoCardless (AJOUTÉ)
-app.post('/api/gocardless/webhook', express.json(), async (req, res) => {
+app.post('/api/gocardless/webhook', async (req, res) => {
   try {
+    // Validation de signature : no-op tant que GOCARDLESS_WEBHOOK_SECRET n'est pas configuré
+    // (voir validateGoCardlessWebhook) — donc sans danger à déployer avant la mise en place du
+    // webhook live. Utilise req.rawBody (octets bruts, cf. verify: sur express.json() plus haut).
+    const signature = req.headers['webhook-signature'];
+    const payload = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body);
+    if (!validateGoCardlessWebhook(payload, signature)) {
+      console.error('[GoCardless][Webhook] Signature invalide, webhook rejeté');
+      return res.status(401).json({ error: 'Signature invalide' });
+    }
+
     console.log('[GoCardless][Webhook] Notification reçue:', req.body);
 
     const { events } = req.body;
@@ -3770,18 +4069,26 @@ app.post('/api/gocardless/webhook', express.json(), async (req, res) => {
       for (const event of events) {
         console.log('[GoCardless][Webhook] Traitement événement:', event.resource_type, event.action);
 
-        switch (event.resource_type) {
-          case 'mandates':
-            await handleMandateEvent(event);
-            break;
-          case 'payments':
-            await handlePaymentEvent(event);
-            break;
-          case 'subscriptions':
-            await handleSubscriptionEvent(event);
-            break;
-          default:
-            console.log('[GoCardless][Webhook] Type d\'événement non géré:', event.resource_type);
+        try {
+          switch (event.resource_type) {
+            case 'mandates':
+              await handleMandateEvent(event);
+              break;
+            case 'payments':
+              await handlePaymentEvent(event);
+              break;
+            case 'subscriptions':
+              await handleSubscriptionEvent(event);
+              break;
+            case 'billing_requests':
+              await handleBillingRequestEvent(event);
+              break;
+            default:
+              console.log('[GoCardless][Webhook] Type d\'événement non géré:', event.resource_type);
+          }
+        } catch (eventError) {
+          // Ne pas laisser un événement en erreur faire échouer tout le batch (GoCardless retente sur non-2xx)
+          console.error('[GoCardless][Webhook] ⚠️ Erreur traitement événement:', event.resource_type, event.action, eventError.message);
         }
       }
     }
@@ -4197,6 +4504,89 @@ async function handleMandateExpiration(mandateId) {
 
   } catch (error) {
     console.error(`[GoCardless] Erreur lors de la gestion de l'expiration du mandat:`, error);
+  }
+}
+
+/**
+ * Gère les événements billing_requests (flux Billing Requests — remplace la création directe de mandat).
+ * Sur "fulfilled" : le client a complété son mandat sur la page hébergée GoCardless. On récupère le
+ * billing_request pour en extraire le mandateId, puis on crée l'abonnement via createSubscriptionForMandate
+ * (même fonction que le filet de sécurité GET /api/gocardless/billing-request-status).
+ */
+async function handleBillingRequestEvent(event) {
+  const { action, links, metadata } = event;
+  const billingRequestId = links?.billing_request;
+
+  try {
+    if (action === 'cancelled' || action === 'expired' || action === 'refused') {
+      const maintenanceId = metadata?.maintenanceId || metadata?.maintenance_id;
+      if (maintenanceId && db) {
+        await updateDoc(doc(db, 'maintenances', maintenanceId), {
+          gcMandateStatus: action === 'cancelled' ? 'cancelled' : (action === 'expired' ? 'expired' : 'cancelled')
+        });
+      }
+      console.log('[GoCardless][BillingRequest] Billing request non abouti:', billingRequestId, action);
+      return;
+    }
+
+    if (action !== 'fulfilled') {
+      console.log('[GoCardless][BillingRequest] Action non gérée:', action, billingRequestId);
+      return;
+    }
+
+    console.log('[GoCardless][BillingRequest] ✅ Fulfilled, récupération du billing_request:', billingRequestId);
+
+    const apiUrl = getGoCardlessApiUrl();
+    const response = await axios.get(`${apiUrl}/billing_requests/${billingRequestId}`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+        'GoCardless-Version': '2015-07-06',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const billingRequest = response.data.billing_requests;
+    // ⚠️ Nom de champ à confirmer contre une vraie réponse sandbox — mandate_request_mandate probable.
+    const mandateId = billingRequest.links?.mandate_request_mandate || billingRequest.links?.mandate || null;
+    const maintenanceId = billingRequest.metadata?.maintenanceId || metadata?.maintenanceId;
+
+    if (!mandateId) {
+      console.error('[GoCardless][BillingRequest] ❌ Aucun mandateId trouvé sur le billing_request fulfilled:', billingRequestId, JSON.stringify(billingRequest.links));
+      return;
+    }
+    if (!maintenanceId || !db) {
+      console.error('[GoCardless][BillingRequest] ❌ maintenanceId manquant dans le metadata, impossible de créer l’abonnement:', billingRequestId);
+      return;
+    }
+
+    const maintenanceSnap = await getDoc(doc(db, 'maintenances', maintenanceId));
+    if (!maintenanceSnap.exists()) {
+      console.error('[GoCardless][BillingRequest] ❌ Maintenance introuvable:', maintenanceId);
+      return;
+    }
+    const maintenance = maintenanceSnap.data();
+
+    if (maintenance.subscriptionId) {
+      console.log('[GoCardless][BillingRequest] ℹ️ Abonnement déjà créé pour cette maintenance, on ne recrée pas:', maintenanceId);
+      return;
+    }
+
+    await createSubscriptionForMandate({
+      mandateId,
+      customerId: billingRequest.links?.customer || null,
+      bankAccountId: billingRequest.links?.customer_bank_account || null,
+      amount: maintenance.monthlyAmount,
+      day_of_month: maintenance.paymentDate,
+      metadata: {
+        contractNumber: maintenance.contractNumber,
+        maintenanceId,
+        clientId: maintenance.clientId
+      }
+    });
+
+    console.log('[GoCardless][BillingRequest] ✅ Abonnement créé suite au mandat live:', maintenanceId);
+  } catch (error) {
+    console.error('[GoCardless][BillingRequest] ❌ Erreur traitement événement:', billingRequestId, error.response?.data || error.message);
   }
 }
 

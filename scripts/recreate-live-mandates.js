@@ -1,13 +1,14 @@
 // Recrée en environnement LIVE le mandat + l'abonnement GoCardless pour des maintenances
-// dont le mandat original a été créé par erreur en sandbox.
+// dont le mandat original a été créé par erreur en sandbox — via le flux Billing Requests
+// (le client complète lui-même son IBAN sur une page hébergée GoCardless, envoyée par email).
 //
-// ⚠️ Effet de bord réel : GoCardless envoie un email/SMS de confirmation de mandat SEPA
-// au client à chaque exécution "live". Ne pas relancer plusieurs fois pour la même maintenance.
+// ⚠️ Effet de bord réel : GoCardless envoie un email/lien de mandat SEPA au client à chaque
+// exécution "live". Ne pas relancer plusieurs fois pour la même maintenance.
 //
 // Usage :
 //   cd gocardless-backend
 //   node scripts/recreate-live-mandates.js                → dry-run (affiche ce qui serait envoyé, aucun appel réel)
-//   node scripts/recreate-live-mandates.js --live          → exécute réellement la création
+//   node scripts/recreate-live-mandates.js --live          → exécute réellement la création + envoi du lien
 //   node scripts/recreate-live-mandates.js --live --only=whvzm2GnTfnZQOMAIwqG
 
 const path = require('path');
@@ -52,23 +53,6 @@ function initFirebaseAdmin() {
   return admin.firestore();
 }
 
-function getAccountHolderNames(m) {
-  const first = m.clientContact?.firstName?.trim();
-  const last = m.clientContact?.lastName?.trim();
-  if (first && last) {
-    return { account_holder_given_name: first, account_holder_family_name: last };
-  }
-  const full = (m.gocardlessAccountHolder || '').trim();
-  const parts = full ? full.split(/\s+/).filter(Boolean) : [];
-  if (parts.length >= 2) {
-    return { account_holder_given_name: parts[0], account_holder_family_name: parts.slice(1).join(' ') };
-  }
-  if (parts.length === 1) {
-    return { account_holder_given_name: '', account_holder_family_name: parts[0] };
-  }
-  return { account_holder_given_name: '', account_holder_family_name: '' };
-}
-
 async function recreateForMaintenance(db, maintenanceId) {
   console.log(`\n=== Maintenance ${maintenanceId} ===`);
 
@@ -84,8 +68,9 @@ async function recreateForMaintenance(db, maintenanceId) {
   console.log('Ancien mandateId (sandbox):', m.gocardlessMandateId || m.mandateId || '—');
   console.log('Ancien subscriptionId (sandbox):', m.subscriptionId || '—');
 
-  if (!m.gocardlessIban || !m.gocardlessAccountHolder) {
-    console.error('❌ IBAN ou titulaire manquant sur ce document, impossible de recréer le mandat.');
+  const clientEmail = m.clientContact?.email || m.signerEmail;
+  if (!clientEmail) {
+    console.error('❌ Aucun email client trouvé, impossible d\'envoyer le lien de prélèvement.');
     return;
   }
   if (!m.monthlyAmount || m.monthlyAmount <= 0) {
@@ -93,41 +78,29 @@ async function recreateForMaintenance(db, maintenanceId) {
     return;
   }
 
-  const names = getAccountHolderNames(m);
   const body = {
-    account_holder_name: m.gocardlessAccountHolder,
-    ...names,
-    iban: m.gocardlessIban,
-    amount: m.monthlyAmount,
-    currency: 'EUR',
-    interval_unit: 'monthly',
-    interval: 1,
-    day_of_month: m.paymentDate ?? 1,
-    metadata: {
-      maintenanceId,
-      contractNumber: m.contractNumber,
-      clientId: m.clientId,
-      clientEmail: m.clientContact?.email,
-      address: m.gocardlessAddress,
-      city: m.gocardlessCity,
-      postalCode: m.gocardlessPostalCode,
-      country: m.gocardlessCountry,
-    },
+    maintenanceId,
+    contractNumber: m.contractNumber,
+    clientId: m.clientId,
+    clientEmail,
+    clientName: m.clientName || m.gocardlessAccountHolder || ''
   };
 
-  console.log('Body envoyé à /create-maintenance-subscription :', JSON.stringify(body, null, 2));
+  console.log('Body envoyé à /api/gocardless/billing-requests :', JSON.stringify(body, null, 2));
 
   if (!isLive) {
     console.log('🟡 DRY-RUN : aucun appel réel effectué (relancer avec --live pour exécuter).');
     return;
   }
 
-  const url = `${BACKEND_BASE_URL}/create-maintenance-subscription`;
+  const url = `${BACKEND_BASE_URL}/api/gocardless/billing-requests`;
   const res = await axios.post(url, body, { headers: { 'Content-Type': 'application/json' } });
   console.log('✅ Réponse backend:', JSON.stringify(res.data, null, 2));
-  console.log('Nouveau mandateId (live):', res.data.mandate?.id);
-  console.log('Nouveau subscriptionId (live):', res.data.subscription?.id);
-  console.log('(Le backend a déjà mis à jour Firestore pour cette maintenance.)');
+  console.log('Lien de prélèvement (authorisationUrl):', res.data.authorisationUrl);
+  console.log('Email envoyé au client:', res.data.emailSent ? 'oui' : 'non — transmettre le lien manuellement');
+  console.log('(Le backend a déjà écrit l\'état "en attente" dans Firestore. L\'abonnement sera créé');
+  console.log(' automatiquement via webhook — ou via "Rafraîchir le statut" dans l\'app — une fois');
+  console.log(' que le client aura complété son mandat sur la page GoCardless.)');
 }
 
 async function main() {
