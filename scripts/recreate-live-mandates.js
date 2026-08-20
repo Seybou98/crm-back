@@ -98,9 +98,28 @@ async function recreateForMaintenance(db, maintenanceId) {
   console.log('✅ Réponse backend:', JSON.stringify(res.data, null, 2));
   console.log('Lien de prélèvement (authorisationUrl):', res.data.authorisationUrl);
   console.log('Email envoyé au client:', res.data.emailSent ? 'oui' : 'non — transmettre le lien manuellement');
-  console.log('(Le backend a déjà écrit l\'état "en attente" dans Firestore. L\'abonnement sera créé');
-  console.log(' automatiquement via webhook — ou via "Rafraîchir le statut" dans l\'app — une fois');
-  console.log(' que le client aura complété son mandat sur la page GoCardless.)');
+
+  // Nettoyer les anciens champs sandbox (mandateId/subscriptionId/...) : sans ça, l'interface
+  // continuerait d'afficher l'ancien mandat/abonnement sandbox comme "actif" pendant que le
+  // client n'a pas encore complété son nouveau mandat live.
+  const hadStaleFields = !!(m.mandateId || m.subscriptionId || m.gocardlessMandateId || m.mandate_id);
+  if (hadStaleFields) {
+    const FieldValue = admin.firestore.FieldValue;
+    await db.collection('maintenances').doc(maintenanceId).update({
+      mandateId: FieldValue.delete(),
+      mandate_id: FieldValue.delete(),
+      gocardlessMandateId: FieldValue.delete(),
+      subscriptionId: FieldValue.delete(),
+      subscriptionStatus: FieldValue.delete(),
+      nextChargeDate: FieldValue.delete(),
+      next_charge_date: FieldValue.delete(),
+      billingMode: FieldValue.delete()
+    });
+    console.log('🧹 Anciens champs sandbox (mandateId/subscriptionId/...) supprimés de Firestore.');
+  }
+
+  console.log('(L\'abonnement sera créé automatiquement via webhook — ou via "Rafraîchir le statut"');
+  console.log(' dans l\'app — une fois que le client aura complété son mandat sur la page GoCardless.)');
 }
 
 async function main() {

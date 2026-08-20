@@ -1160,121 +1160,122 @@ app.post('/create-maintenance-subscription', async (req, res) => {
   }
 });
 
+// Fonction partagée : crée un Billing Request + Billing Request Flow, écrit l'état "en attente"
+// dans Firestore et envoie l'email de finalisation. Utilisée par la route HTTP ci-dessous ET par
+// le webhook DocuSign (portail Entretien-Project) qui doit déclencher ça côté serveur, sans
+// passer par le frontend CRM (le client signe et paie sans jamais ouvrir la CRM).
+async function createBillingRequestForMaintenance({
+  maintenanceId,
+  contractNumber,
+  clientId,
+  clientEmail,
+  clientName,
+  redirect_uri,
+  exit_uri
+}) {
+  if (!maintenanceId) {
+    throw new Error('maintenanceId est requis');
+  }
+  if (!process.env.GOCARDLESS_ACCESS_TOKEN || !process.env.GOCARDLESS_CREDITOR_ID) {
+    throw new Error('Configuration GoCardless manquante (token ou creditor)');
+  }
+  if (!db) {
+    throw new Error('Firebase non initialisé');
+  }
+
+  const apiUrl = getGoCardlessApiUrl();
+  const limitedMetadata = {
+    contractNumber: contractNumber || '',
+    maintenanceId: maintenanceId || '',
+    clientId: clientId || ''
+  };
+
+  console.log('[GoCardless][BillingRequest] 🚀 Création billing_request pour maintenance:', maintenanceId);
+
+  const billingRequestResponse = await axios.post(`${apiUrl}/billing_requests`, {
+    billing_requests: {
+      mandate_request: {
+        currency: 'EUR',
+        scheme: 'sepa_core'
+      },
+      metadata: limitedMetadata
+    }
+  }, {
+    headers: {
+      'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+      'GoCardless-Version': '2015-07-06',
+      'Content-Type': 'application/json'
+    }
+  });
+
+  const billingRequestId = billingRequestResponse.data.billing_requests.id;
+  console.log('[GoCardless][BillingRequest] ✅ Billing request créé:', billingRequestId);
+
+  // redirect_uri/exit_uri : le client ne revient jamais dans le CRM (flux par email), une page
+  // de destination minimale suffit — voir points ouverts du plan (URL https joignable requise en live).
+  const frontendUrl = (process.env.FRONTEND_URL || process.env.PUBLIC_URL || 'http://localhost:5173').replace(/\/$/, '');
+  const flowResponse = await axios.post(`${apiUrl}/billing_request_flows`, {
+    billing_request_flows: {
+      redirect_uri: redirect_uri || `${frontendUrl}/prelevement-confirme`,
+      exit_uri: exit_uri || `${frontendUrl}/prelevement-annule`,
+      links: { billing_request: billingRequestId }
+    }
+  }, {
+    headers: {
+      'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
+      'GoCardless-Version': '2015-07-06',
+      'Content-Type': 'application/json'
+    }
+  });
+
+  const billingRequestFlow = flowResponse.data.billing_request_flows;
+  const authorisationUrl = billingRequestFlow.authorisation_url;
+  console.log('[GoCardless][BillingRequest] ✅ Flow créé, authorisation_url:', authorisationUrl);
+
+  // Écrire l'état "en attente" immédiatement, avant même l'envoi de l'email
+  const maintenanceRef = doc(db, 'maintenances', maintenanceId);
+  await updateDoc(maintenanceRef, {
+    gcBillingRequestId: billingRequestId,
+    gcBillingRequestFlowId: billingRequestFlow.id,
+    gcBillingRequestUrl: authorisationUrl,
+    gcMandateStatus: 'pending_customer_action',
+    gcBillingRequestSentAt: new Date().toISOString(),
+    gocardlessSubscriptionPending: false
+  });
+
+  // Email non bloquant : le lien reste utilisable (copier/coller manuel) même si l'envoi échoue
+  let emailSent = false;
+  try {
+    if (clientEmail) {
+      await sendBillingRequestLinkEmail({
+        toEmail: clientEmail,
+        clientName: clientName || '',
+        contractNumber: contractNumber || '',
+        authorisationUrl
+      });
+      emailSent = true;
+    }
+  } catch (emailError) {
+    console.error('[GoCardless][BillingRequest] ⚠️ Erreur envoi email (non bloquant):', emailError.message);
+  }
+
+  try {
+    await updateDoc(maintenanceRef, { gcBillingRequestEmailStatus: emailSent ? 'success' : 'error' });
+  } catch (e) {
+    console.warn('[GoCardless][BillingRequest] Impossible d’écrire gcBillingRequestEmailStatus:', e.message);
+  }
+
+  return { billingRequestId, billingRequestFlowId: billingRequestFlow.id, authorisationUrl, emailSent };
+}
+
 // POST /api/gocardless/billing-requests — crée un Billing Request + Billing Request Flow.
 // Remplace la création directe de mandat (IBAN saisi côté serveur), interdite par GoCardless
 // en live sans approbation "scheme rules compliant". Le client saisit lui-même son IBAN sur
 // la page hébergée GoCardless (authorisationUrl), envoyée par email.
 app.post('/api/gocardless/billing-requests', async (req, res) => {
   try {
-    const {
-      maintenanceId,
-      contractNumber,
-      clientId,
-      clientEmail,
-      clientName,
-      redirect_uri,
-      exit_uri
-    } = req.body;
-
-    if (!maintenanceId) {
-      return res.status(400).json({ error: 'maintenanceId est requis' });
-    }
-    if (!process.env.GOCARDLESS_ACCESS_TOKEN || !process.env.GOCARDLESS_CREDITOR_ID) {
-      return res.status(500).json({ error: 'Configuration GoCardless manquante (token ou creditor)' });
-    }
-    if (!db) {
-      return res.status(500).json({ error: 'Firebase non initialisé' });
-    }
-
-    const apiUrl = getGoCardlessApiUrl();
-    const limitedMetadata = {
-      contractNumber: contractNumber || '',
-      maintenanceId: maintenanceId || '',
-      clientId: clientId || ''
-    };
-
-    console.log('[GoCardless][BillingRequest] 🚀 Création billing_request pour maintenance:', maintenanceId);
-
-    const billingRequestResponse = await axios.post(`${apiUrl}/billing_requests`, {
-      billing_requests: {
-        mandate_request: {
-          currency: 'EUR',
-          scheme: 'sepa_core'
-        },
-        metadata: limitedMetadata
-      }
-    }, {
-      headers: {
-        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
-        'GoCardless-Version': '2015-07-06',
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const billingRequestId = billingRequestResponse.data.billing_requests.id;
-    console.log('[GoCardless][BillingRequest] ✅ Billing request créé:', billingRequestId);
-
-    // redirect_uri/exit_uri : le client ne revient jamais dans le CRM (flux par email), une page
-    // de destination minimale suffit — voir points ouverts du plan (URL https joignable requise en live).
-    const frontendUrl = (process.env.FRONTEND_URL || process.env.PUBLIC_URL || 'http://localhost:5173').replace(/\/$/, '');
-    const flowResponse = await axios.post(`${apiUrl}/billing_request_flows`, {
-      billing_request_flows: {
-        redirect_uri: redirect_uri || `${frontendUrl}/prelevement-confirme`,
-        exit_uri: exit_uri || `${frontendUrl}/prelevement-annule`,
-        links: { billing_request: billingRequestId }
-      }
-    }, {
-      headers: {
-        'Authorization': `Bearer ${process.env.GOCARDLESS_ACCESS_TOKEN}`,
-        'GoCardless-Version': '2015-07-06',
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const billingRequestFlow = flowResponse.data.billing_request_flows;
-    const authorisationUrl = billingRequestFlow.authorisation_url;
-    console.log('[GoCardless][BillingRequest] ✅ Flow créé, authorisation_url:', authorisationUrl);
-
-    // Écrire l'état "en attente" immédiatement, avant même l'envoi de l'email
-    const maintenanceRef = doc(db, 'maintenances', maintenanceId);
-    await updateDoc(maintenanceRef, {
-      gcBillingRequestId: billingRequestId,
-      gcBillingRequestFlowId: billingRequestFlow.id,
-      gcBillingRequestUrl: authorisationUrl,
-      gcMandateStatus: 'pending_customer_action',
-      gcBillingRequestSentAt: new Date().toISOString(),
-      gocardlessSubscriptionPending: false
-    });
-
-    // Email non bloquant : le lien reste utilisable (copier/coller manuel) même si l'envoi échoue
-    let emailSent = false;
-    try {
-      if (clientEmail) {
-        await sendBillingRequestLinkEmail({
-          toEmail: clientEmail,
-          clientName: clientName || '',
-          contractNumber: contractNumber || '',
-          authorisationUrl
-        });
-        emailSent = true;
-      }
-    } catch (emailError) {
-      console.error('[GoCardless][BillingRequest] ⚠️ Erreur envoi email (non bloquant):', emailError.message);
-    }
-
-    try {
-      await updateDoc(maintenanceRef, { gcBillingRequestEmailStatus: emailSent ? 'success' : 'error' });
-    } catch (e) {
-      console.warn('[GoCardless][BillingRequest] Impossible d’écrire gcBillingRequestEmailStatus:', e.message);
-    }
-
-    res.json({
-      success: true,
-      billingRequestId,
-      billingRequestFlowId: billingRequestFlow.id,
-      authorisationUrl,
-      emailSent
-    });
+    const result = await createBillingRequestForMaintenance(req.body || {});
+    res.json({ success: true, ...result });
   } catch (error) {
     const errData = error.response?.data;
     console.error('[GoCardless][BillingRequest] ❌ Erreur création billing request:', error.message, error.response?.status, error.config?.url);
@@ -3322,8 +3323,19 @@ app.post('/api/gocardless/sync-maintenance-payments', async (req, res) => {
       if (item.gocardlessPaymentId) paymentIds.add(item.gocardlessPaymentId);
     });
 
-    // 2) Si aucun ID enregistré mais on a un numéro de contrat, récupérer les paiements GoCardless par description
-    if (paymentIds.size === 0 && contractNumber) {
+    // Échéance passée sans statut final (ni payé ni échoué) : signe qu'un paiement généré côté
+    // GoCardless (ex. par l'abonnement) n'a jamais été rattaché à cette ligne — le webhook a pu
+    // le manquer. Dans ce cas on élargit la recherche même si d'autres paiements sont déjà connus,
+    // sinon ce paiement resterait introuvable indéfiniment (voir point 2 ci-dessous).
+    const hasUnresolvedOverduePayment = paymentSchedule.some((item) => {
+      const due = new Date(item.dueDate);
+      if (Number.isNaN(due.getTime()) || due >= new Date()) return false;
+      return item.status !== 'paid' && item.status !== 'failed';
+    });
+
+    // 2) Si aucun ID enregistré (ou une échéance passée reste non résolue) et qu'on a un numéro de
+    // contrat, récupérer les paiements GoCardless par description pour retrouver ceux non rattachés.
+    if ((paymentIds.size === 0 || hasUnresolvedOverduePayment) && contractNumber) {
       try {
         const listRes = await axios.get(`${apiUrl}/payments?limit=300`, { headers });
         const allPayments = listRes.data.payments || [];
@@ -3721,14 +3733,9 @@ app.post('/api/portal/create-contract', async (req, res) => {
     if (typeof paymentDate !== 'number') missing.push('paymentDate');
     if (paymentMethod !== 'gocardless' && paymentMethod !== 'manual') missing.push('paymentMethod');
 
-    if (paymentMethod === 'gocardless') {
-      if (!gocardlessIban) missing.push('gocardlessIban');
-      if (!gocardlessAccountHolder) missing.push('gocardlessAccountHolder');
-      if (!gocardlessAddress) missing.push('gocardlessAddress');
-      if (!gocardlessPostalCode) missing.push('gocardlessPostalCode');
-      if (!gocardlessCity) missing.push('gocardlessCity');
-      if (!gocardlessCountry) missing.push('gocardlessCountry');
-    }
+    // IBAN/titulaire/adresse sont désormais facultatifs et indicatifs : le mandat SEPA réel se
+    // met en place après signature via un Billing Request (lien GoCardless envoyé par email),
+    // pas avec ces champs saisis côté portail.
 
     if (missing.length) {
       return res.status(400).json({ error: 'Champs requis manquants', missing });
@@ -3998,44 +4005,29 @@ app.post('/api/docusign/webhook', express.json(), async (req, res) => {
           } catch (_ignored) {}
         }
 
-        // 2) Créer automatiquement l’abonnement GoCardless après signature (si requis)
+        // 2) Envoyer automatiquement le lien de prélèvement GoCardless après signature (si requis).
+        // Ne crée plus de mandat directement avec l'IBAN saisi côté portail (bloqué par GoCardless
+        // en live) — on passe par un Billing Request : le client finalise lui-même son IBAN sur une
+        // page hébergée GoCardless, reçue par email (voir createBillingRequestForMaintenance).
         try {
-          const shouldCreateSubscription =
+          const shouldSendBillingRequest =
             previousMaintenanceData?.gocardlessSubscriptionPending === true &&
             previousMaintenanceData?.paymentMethod === 'gocardless' &&
-            previousMaintenanceData?.gocardlessIban &&
-            previousMaintenanceData?.gocardlessAccountHolder &&
             typeof previousMaintenanceData?.monthlyAmount === 'number' &&
             previousMaintenanceData?.monthlyAmount > 0;
 
-          if (shouldCreateSubscription) {
-            const baseUrl = `${req.protocol}://${req.get('host')}`;
-            await axios.post(`${baseUrl}/create-maintenance-subscription`, {
-              account_holder_name: previousMaintenanceData.gocardlessAccountHolder,
-              iban: previousMaintenanceData.gocardlessIban,
-              amount: previousMaintenanceData.monthlyAmount,
-              currency: 'EUR',
-              interval_unit: 'monthly',
-              interval: 1,
-              start_date: previousMaintenanceData.lastMaintenance,
-              // Certaines maintenances stockent paymentDate en string ("14") → on cast pour éviter fallback à 1.
-              day_of_month: Number(previousMaintenanceData.paymentDate) || 1,
-              metadata: {
-                contractNumber: previousMaintenanceData.contractNumber || '',
-                maintenanceId: maintenanceId,
-                clientId: previousMaintenanceData.clientId || '',
-                address: previousMaintenanceData.gocardlessAddress || '',
-                city: previousMaintenanceData.gocardlessCity || '',
-                postalCode: previousMaintenanceData.gocardlessPostalCode || '',
-                country: previousMaintenanceData.gocardlessCountry || 'FR',
-                clientEmail: previousMaintenanceData.signerEmail || previousMaintenanceData.clientContact?.email || ''
-              }
-            }, {
-              headers: { 'Content-Type': 'application/json' }
+          if (shouldSendBillingRequest) {
+            const clientEmail = previousMaintenanceData.signerEmail || previousMaintenanceData.clientContact?.email || '';
+            await createBillingRequestForMaintenance({
+              maintenanceId,
+              contractNumber: previousMaintenanceData.contractNumber || '',
+              clientId: previousMaintenanceData.clientId || '',
+              clientEmail,
+              clientName: previousMaintenanceData.clientName || previousMaintenanceData.gocardlessAccountHolder || ''
             });
           }
         } catch (e) {
-          console.warn('[DocuSign][Webhook] Création abonnement GoCardless échouée:', e.message || e);
+          console.warn('[DocuSign][Webhook] Envoi du lien de prélèvement GoCardless échoué:', e.message || e);
         }
       } else {
         console.log('[DocuSign][Webhook] No maintenance found for envelope', { envelopeId });
