@@ -115,15 +115,6 @@ async function updateDoc(docRef, data) {
 }
 
 const app = express();
-// Augmenter la limite de taille pour permettre l'envoi de PDF en base64 (jusqu'à 50MB)
-// verify: conserve les octets bruts du body (req.rawBody) AVANT parsing JSON — nécessaire pour
-// valider la signature HMAC des webhooks GoCardless (JSON.stringify(req.body) ne reproduit pas
-// forcément les octets exacts signés par GoCardless : ordre des clés, espaces, etc.)
-app.use(express.json({
-  limit: '50mb',
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // Configuration CORS dynamique pour production
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:5173',
@@ -131,9 +122,11 @@ const allowedOrigins = [
   'https://labelenergie2.netlify.app', // Frontend Netlify (ancien)
   'https://labelenergie1.netlify.app', // Frontend Netlify (nouveau)
   'https://labelenergie234.netlify.app', // Frontend Netlify test
+  'https://crm-regie.netlify.app', // Frontend Netlify (formulaire demande d'ouverture de compte régie)
   'http://localhost:5173', // Fallback pour développement
   'http://localhost:3000',  // Fallback pour développement
-  'http://localhost:4173'   // Fallback pour développement
+  'http://localhost:4173',
+  'https://www.labelenergie.fr/',   // Fallback pour développement
 ];
 
 function isAllowedLanDevOrigin(origin) {
@@ -171,6 +164,17 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin']
 }));
 
+// (Déplacé APRÈS le CORS : une erreur du parseur — ex. 413 corps > 50 Mo — doit partir avec les
+// en-têtes CORS, sinon le navigateur n'affiche qu'un "Load failed" / "Failed to fetch" illisible.)
+// Augmenter la limite de taille pour permettre l'envoi de PDF en base64 (jusqu'à 50MB)
+// verify: conserve les octets bruts du body (req.rawBody) AVANT parsing JSON — nécessaire pour
+// valider la signature HMAC des webhooks GoCardless (JSON.stringify(req.body) ne reproduit pas
+// forcément les octets exacts signés par GoCardless : ordre des clés, espaces, etc.)
+app.use(express.json({
+  limit: '50mb',
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // Routes de test pour YouSign et GoCardless
 app.use('/', testRoutes);
 
