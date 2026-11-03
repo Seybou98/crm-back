@@ -3337,6 +3337,23 @@ app.post('/api/gocardless/sync-maintenance-payments', async (req, res) => {
       return item.status !== 'paid' && item.status !== 'failed';
     });
 
+    // 1bis) Paiements de l'abonnement actuellement lié au contrat. Un abonnement créé pour un autre contrat (ou rattaché
+    // après coup) génère des paiements dont la description ne porte pas ce numéro de contrat : la recherche par
+    // description (ci-dessous) ne les trouverait jamais. On les interroge donc directement par abonnement.
+    if (maintenance.subscriptionId) {
+      try {
+        const subRes = await axios.get(`${apiUrl}/payments`, {
+          headers,
+          params: { subscription: maintenance.subscriptionId, limit: 500 }
+        });
+        const doAbonnement = subRes.data.payments || [];
+        doAbonnement.forEach(p => paymentIds.add(p.id));
+        console.log(`[GoCardless] ${doAbonnement.length} paiement(s) trouvé(s) pour l'abonnement ${maintenance.subscriptionId} (maintenance ${maintenanceId})`);
+      } catch (err) {
+        console.error('[GoCardless] Erreur liste paiements par abonnement:', err.response?.data || err.message);
+      }
+    }
+
     // 2) Si aucun ID enregistré (ou une échéance passée reste non résolue) et qu'on a un numéro de
     // contrat, récupérer les paiements GoCardless par description pour retrouver ceux non rattachés.
     if ((paymentIds.size === 0 || hasUnresolvedOverduePayment) && contractNumber) {
